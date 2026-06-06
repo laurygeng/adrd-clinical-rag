@@ -1,0 +1,40 @@
+/Users/minjie/Desktop/code/rag_adrd/code/retrieval/advanced_retriever.py:130: LangChainDeprecationWarning: The class `Chroma` was deprecated in LangChain 0.2.9 and will be removed in 1.0. An updated version of the class exists in the `langchain-chroma package and should be used instead. To use it run `pip install -U `langchain-chroma` and import as `from `langchain_chroma import Chroma``.
+  self.vector_store = LCChroma(
+
+Retrieving:   0%|          | 0/149 [00:00<?, ?it/s]
+Retrieving:   0%|          | 0/149 [00:01<?, ?it/s]
+Traceback (most recent call last):
+  File "/Users/minjie/Desktop/code/rag_adrd/code/retrieval/run_retrieval_ADRD.py", line 368, in <module>
+    main()
+  File "/Users/minjie/Desktop/code/rag_adrd/code/retrieval/run_retrieval_ADRD.py", line 208, in main
+    extraction_result = extract_and_cite_facts(q, passages)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/minjie/Desktop/code/rag_adrd/code/retrieval/llm_utils.py", line 5, in extract_and_cite_facts
+    client = get_openai_client()
+             ^^^^^^^^^^^^^^^^^^^
+  File "/Users/minjie/Desktop/code/rag_adrd/code/retrieval/llm_utils.py", line 36, in get_openai_client
+    client = openai.OpenAI(api_key=api_key, base_url=base_url) if base_url else openai.OpenAI(api_key=api_key)
+                                                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/minjie/miniconda3/envs/rag_env/lib/python3.11/site-packages/openai/_client.py", line 135, in __init__
+    raise OpenAIError(
+openai.OpenAIError: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable
+
+ERROR conda.cli.main_run:execute(127): `conda run python retrieval/run_retrieval_ADRD.py --top_k 5 --window 500 --subset all --output_dir retrieval/retrieval_results` failed. (See above for error)
+🔧 Initializing NLI Verifier...
+🔧 Initializing Cross-Encoder for web relevance scoring...
+⚙️  Config — Top-K: 5 | Pre-K: 25 | Window: 500
+           BM25: 0.5 | Vector: 0.5 | Subset: all
+
+🔧 Initializing AdvancedRetriever...
+🛠️ Preloading retrieval components...
+✅ Retrieval components preloaded successfully.
+📥 Loading MC questions from ADRD_Caregiving_Multiple_Choice.json...
+  ✅ 29 MC questions loaded.
+📥 Loading T/F questions from ADRD_Caregiving_True_or_False.json...
+  ✅ 120 T/F questions loaded.
+
+📊 Total questions to retrieve: 149
+
+🚀 Starting retrieval for 149 questions...
+
+

@@ -1,0 +1,13 @@
+{
+  "name": "rag_system",
+  "version": "1.0.0",
+  "description": "Node.js client for RAG system",
+  "main": "ai.cjs",
+  "scripts": {
+    "start": "node ai.cjs"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.4.0"
+  }
+}
