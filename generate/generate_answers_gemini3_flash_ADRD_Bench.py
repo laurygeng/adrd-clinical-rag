@@ -249,7 +249,7 @@ def main():
                 context = build_context_from_passages(
                     entry.get("passages", []),
                     GEN_CONFIG.max_context_snippets,
-                    scores=entry.get("scores", []),
+                    # scores=entry.get("scores", []),
                 )
                 # If TF and a TF_Verdict exists from the retrieval step, inject it as a high-priority hint
                 if q_type == "TF" and entry.get("tf_verdict"):
