@@ -132,11 +132,22 @@ def generate_answer(client, question, context=""):
 # ==========================================
 
 def check_accuracy(generated, ground_truth, correct_letter, q_type):
+    # 原始逻辑非常直接，对模型输出的格式要求极其苛刻
     first_token = generated.strip().split()[0].rstrip(".,!?:").upper() if generated.strip() else ""
+    
     if q_type == "TF":
-        return first_token == ground_truth.strip().upper()
+        gt = ground_truth.strip().upper()
+        # 这里逻辑较窄：只认 YES/TRUE 和 NO/FALSE 对应的严格匹配
+        if gt == "YES" and first_token in ("YES", "TRUE"):
+            return True
+        if gt == "NO" and first_token in ("NO", "FALSE"):
+            return True
+        return first_token == gt
+        
     elif q_type == "MC":
+        # 严格要求首个 token 与正确字母匹配
         return first_token == correct_letter.strip().upper()
+        
     return False
 
 
