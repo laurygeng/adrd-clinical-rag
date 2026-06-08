@@ -21,7 +21,7 @@ class RAGConfig:
     # ==========================================
     # 2. Retrieval Parameters (run_retrieval_adrd.py)
     # ==========================================
-    retrieval_top_k = 7
+    retrieval_top_k = 20
     retrieval_pre_k = 25
     retrieval_window_size = 800
     bm25_weight = 0.65

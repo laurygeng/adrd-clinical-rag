@@ -2,6 +2,7 @@
 import os
 import json
 import uuid
+import hashlib
 import pickle
 import logging
 from typing import List, Dict
@@ -27,13 +28,16 @@ class ProcessedNode:
 
 class IncrementalIngestionPipeline:
     def __init__(self):
+        # Define directories for storing intermediate RAG files and the Chroma vector database
         self.output_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../knowledge_base/advanced_rag'))
         self.chroma_persist_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../knowledge_base/braincheck_vectordb'))
         os.makedirs(self.output_dir, exist_ok=True)
 
+        # Set up the document loader pointing to the raw PDF/Docx files
         input_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../knowledge_base/raw_files'))
         self.loader = SimpleBrainCheckLoader(local_folder_path=input_dir)
         
+        # Load the tracking file to prevent re-processing already ingested documents
         self.status_file = os.path.join(self.output_dir, "processed_files.json")
         self.processed_files = self._load_status()
 
@@ -57,12 +61,14 @@ class IncrementalIngestionPipeline:
         )
 
     def _load_status(self) -> List[str]:
+        """Loads the list of already processed filenames."""
         if os.path.exists(self.status_file):
             with open(self.status_file, "r", encoding="utf-8") as f:
                 return json.load(f)
         return []
 
     def _save_status(self):
+        """Saves the list of processed filenames to prevent future duplication."""
         with open(self.status_file, "w", encoding="utf-8") as f:
             json.dump(self.processed_files, f, ensure_ascii=False, indent=2)
 
@@ -73,6 +79,7 @@ class IncrementalIngestionPipeline:
             print("❌ No documents found in target folder.")
             return
 
+        # Filter out documents that have already been processed
         new_docs = [d for d in raw_docs if d.metadata.get('source_file') not in self.processed_files]
         if not new_docs:
             print("✨ All documents are up to date. No new files to ingest.")
@@ -83,7 +90,7 @@ class IncrementalIngestionPipeline:
         
         processed_nodes = []
         for doc in new_docs:
-            # Apply structural markdown splitting first
+            # Apply structural markdown splitting first to preserve logical boundaries
             try:
                 md_docs = self.markdown_splitter.split_text(doc.page_content)
                 # Inherit original document metadata (like source_file) into the markdown-split docs
@@ -103,7 +110,9 @@ class IncrementalIngestionPipeline:
             parent_chunks = self.parent_splitter.split_documents(md_docs)
             
             for parent in parent_chunks:
-                parent_id = str(uuid.uuid4())
+                # [FIX]: Use a deterministic hash of the content instead of a random UUID.
+                # This prevents duplicate entries in ChromaDB if the script is rerun on the same files.
+                parent_id = hashlib.md5(parent.page_content.encode('utf-8')).hexdigest()
                 
                 # Apply token-based child chunking
                 child_chunks = self.child_splitter.split_documents([parent])
@@ -115,9 +124,12 @@ class IncrementalIngestionPipeline:
                     header_context = " > ".join([v for k, v in meta.items() if k.startswith('Header')])
                     augmented_child_content = f"[{header_context}]\n{child.page_content}" if header_context else child.page_content
 
+                    # [FIX]: Use a deterministic hash for the child chunk as well.
+                    child_id = hashlib.md5(augmented_child_content.encode('utf-8')).hexdigest()
+
                     processed_nodes.append(
                         ProcessedNode(
-                            child_id=str(uuid.uuid4()),
+                            child_id=child_id,
                             child_content=augmented_child_content,
                             parent_id=parent_id,
                             parent_content=parent.page_content,
@@ -126,13 +138,28 @@ class IncrementalIngestionPipeline:
                     )
             self.processed_files.append(doc.metadata.get('source_file'))
 
+        # Save updates to local dicts, pickles, and the vector database
         self._update_local_stores(processed_nodes)
         self._save_status()
 
     def _update_local_stores(self, nodes: List[ProcessedNode]):
+        """Updates the parent mapping, the pickle backup, and pushes embeddings to ChromaDB."""
+        
+        # [FIX]: Deduplicate nodes by child_id before processing
+        # Identical text chunks (e.g., standard disclaimers, repeated headers) will produce the same MD5 hash.
+        unique_nodes_dict = {}
+        for node in nodes:
+            unique_nodes_dict[node.child_id] = node
+        
+        original_count = len(nodes)
+        nodes = list(unique_nodes_dict.values())
+        if len(nodes) < original_count:
+            print(f"🧹 Deduplicated identical chunks within this batch: {original_count} -> {len(nodes)}")
+
         parent_map_path = os.path.join(self.output_dir, "parent_map.json")
         pkl_path = os.path.join(self.output_dir, "vector_ready_children.pkl")
 
+        # 1. Update Parent Mapping (used during retrieval for expanding context windows)
         parent_map = {}
         if os.path.exists(parent_map_path):
             with open(parent_map_path, "r", encoding='utf-8') as f:
@@ -142,6 +169,7 @@ class IncrementalIngestionPipeline:
         with open(parent_map_path, "w", encoding='utf-8') as f:
             json.dump(parent_map, f, ensure_ascii=False, indent=2)
 
+        # 2. Update Vector Ready Children (Pickle backup for fast loading)
         vector_ready_docs = []
         if os.path.exists(pkl_path):
             with open(pkl_path, "rb") as f:
@@ -161,6 +189,7 @@ class IncrementalIngestionPipeline:
         with open(pkl_path, "wb") as f:
             pickle.dump(vector_ready_docs, f)
 
+        # 3. Embed and push to ChromaDB
         if new_vector_docs:
             print(f"🔗 Embedding and pushing {len(new_vector_docs)} new chunks to ChromaDB...")
             client = chromadb.PersistentClient(path=self.chroma_persist_dir)
@@ -177,7 +206,8 @@ class IncrementalIngestionPipeline:
             batch_size = config.chroma_batch_size
             for i in range(0, len(new_vector_docs), batch_size):
                 end = min(i + batch_size, len(new_vector_docs))
-                collection.add(
+                # [FIX]: Use upsert() instead of add() so it handles existing IDs or exact duplicates smoothly
+                collection.upsert(
                     ids=ids[i:end], documents=texts[i:end], embeddings=embeddings[i:end], metadatas=metadatas[i:end]
                 )
         print(f"✅ Successfully appended {len(nodes)} chunks to the RAG knowledge base.")

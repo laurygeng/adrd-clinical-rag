@@ -125,40 +125,8 @@ def decompose_mc_options(stem, options_dict, model=None):
         "  1. Combine the key concept from the stem with the specific factual claim in that option.\n"
         "  2. Be phrased as a factual keyword/phrase search (≤15 words), NOT a full sentence.\n"
         "  3. Avoid repeating information that is identical across options.\n"
-        "Output JSON: {\"option_queries\": {\"A\": \"query_a\", \"B\": \"query_b\", \"C\": \"query_c\", \"D\": \"query_d\"}}"
-    )
-    options_str = "\n".join([f"{k}. {v}" for k, v in options_dict.items()])
-    user_content = f"Stem: {stem}\nOptions:\n{options_str}"
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_content}
-            ],
-            response_format={"type": "json_object"}
-        )
-        content = response.choices[0].message.content
-        return content if content else '{"option_queries": {}}'
-    except Exception as e:
-        print(f"decompose_mc_options API failed: {e}")
-        return '{"option_queries": {}}'
-    """
-    Multiple Choice option decomposition: Generate a targeted fact-checking retrieval query independently for each option.
-    """
-    if model is None: model = config.llm_rewrite_model
-    client = get_openai_client()
-    system_prompt = (
-        "You are a medical information retrieval expert specializing in ADRD "
-        "(Alzheimer's Disease and Related Dementias). "
-        "Given a multiple-choice question stem and its options, generate ONE focused factual "
-        "search query PER OPTION that would retrieve documents directly verifying or refuting "
-        "that specific option's claim. "
-        "Each query must:\n"
-        "  1. Combine the key concept from the stem with the specific factual claim in that option.\n"
-        "  2. Be phrased as a factual keyword/phrase search (≤15 words), NOT a full sentence.\n"
-        "  3. Avoid repeating information that is identical across options.\n"
-        "Output JSON: {\"option_queries\": {\"A\": \"query_a\", \"B\": \"query_b\", \"C\": \"query_c\", \"D\": \"query_d\"}}"
+        "Output JSON: A dictionary where keys are the exact option letters provided (e.g., \"A\", \"B\", \"C\", \"D\", \"E\") and values are the generated queries. "
+        "Example: {\"option_queries\": {\"A\": \"query_a\", \"B\": \"query_b\", \"C\": \"query_c\", \"E\": \"query_e\"}}"
     )
     options_str = "\n".join([f"{k}. {v}" for k, v in options_dict.items()])
     user_content = f"Stem: {stem}\nOptions:\n{options_str}"
