@@ -54,7 +54,7 @@ RAG_USER_TEMPLATE = (
 
 @dataclass(frozen=True)
 class GenerationConfig:
-    max_context_snippets: int = 5
+    max_context_snippets: int = 10
     openai_temperature: float = 0.1
     openai_max_tokens: int = 350
     gemini_max_output_tokens: int = 350
