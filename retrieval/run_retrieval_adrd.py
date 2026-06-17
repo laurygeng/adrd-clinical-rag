@@ -2,11 +2,22 @@
 import os
 import sys
 import json
+import math
+import hashlib
 import argparse
 import pandas as pd
 import nltk
 from datetime import datetime
 from tqdm import tqdm
+
+
+def logit_to_prob(x):
+    return 1 / (1 + math.exp(-max(min(x, 100), -100)))
+
+
+def passage_id(src, text):
+    """Stable dedup id (builtin hash() is process-salted and not reproducible)."""
+    return f"{src}__{hashlib.md5(text.encode('utf-8')).hexdigest()}"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -91,8 +102,16 @@ def main():
     output_path = os.path.join(PROJECT_ROOT, "retrieval_results", f"retrieval_ADRD_{args.subset}_LOCAL_WEB_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
 
     results = []
+    checkpoint_every = getattr(config, "checkpoint_every", 5)
 
-    for item in tqdm(questions, desc="Retrieving"):
+    def save_results():
+        # Atomic-ish write: dump to a temp file then replace, so a crash mid-write
+        # never corrupts the checkpoint.
+        tmp_path = output_path + ".tmp"
+        pd.DataFrame(results).to_csv(tmp_path, index=False, encoding="utf-8-sig")
+        os.replace(tmp_path, output_path)
+
+    for idx, item in enumerate(tqdm(questions, desc="Retrieving")):
         q_type = item["Type"]
         original_question = item["Question"]
         question_id = item["Question_ID"]
@@ -132,7 +151,7 @@ def main():
         # STEP 3: Local cutoff
         for p, s, src in all_pool:
             if len(retrieved_contexts) >= args.top_k: break
-            pid = f"{src}__{hash(p)}"
+            pid = passage_id(src, p)
             if pid not in retrieved_chunk_ids:
                 retrieved_contexts.append(p)
                 sources.append(src)
@@ -188,6 +207,7 @@ def main():
                     queries=web_queries_used,
                     per_query_k=getattr(config, "web_per_query_k", 5),
                     max_page_chars=getattr(config, "web_max_page_chars", 25000),
+                    max_sentences_per_source=getattr(config, "web_max_sentences_per_source", 12),
                 )
 
                 if not wp: break
@@ -204,14 +224,10 @@ def main():
                         original_question, merged_passages, merged_sources
                     )
 
-                    import math
-                    def logit_to_prob(x):
-                        return 1 / (1 + math.exp(-max(min(x, 100), -100)))
-
                     retrieved_contexts, sources, scores, retrieved_chunk_ids = [], [], [], set()
                     for p, src, lg in zip(reranked_passages, reranked_sources, reranked_logits):
                         if len(retrieved_contexts) >= args.top_k: break
-                        pid = f"{src}__{hash(p)}"
+                        pid = passage_id(src, p)
                         if pid in retrieved_chunk_ids: continue
                         
                         retrieved_chunk_ids.add(pid)
@@ -257,7 +273,12 @@ def main():
             "Web_Sources": json.dumps(list(dict.fromkeys(web_sources_used))[:30], ensure_ascii=False),
         })
 
-    pd.DataFrame(results).to_csv(output_path, index=False, encoding="utf-8-sig")
+        # Incremental checkpoint so a mid-run crash (esp. with web fallback enabled)
+        # does not lose all completed questions.
+        if checkpoint_every and (idx + 1) % checkpoint_every == 0:
+            save_results()
+
+    save_results()
     print(f"\n✅ Sentence-Level CRAG Retrieval Complete! Saved to {output_path}")
 
 

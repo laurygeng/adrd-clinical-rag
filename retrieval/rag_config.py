@@ -18,6 +18,14 @@ class RAGConfig:
     embed_model_name = 'BAAI/bge-large-en-v1.5'  # 换成高维度的、更强大的向量模型
     chroma_batch_size = 500
 
+    # BGE embeddings work best with L2-normalized vectors + cosine space, and with
+    # a query-side instruction prefix (passages are embedded WITHOUT any instruction).
+    # NOTE: changing embed_normalize / embed_space only takes effect after re-ingesting
+    # (the vector DB must be rebuilt so stored vectors match the query-side settings).
+    embed_normalize = True
+    embed_space = "cosine"
+    bge_query_instruction = "Represent this sentence for searching relevant passages: "
+
     # ==========================================
     # 2. Retrieval Parameters (run_retrieval_adrd.py)
     # ==========================================
@@ -27,6 +35,7 @@ class RAGConfig:
     bm25_weight = 0.3
     vector_weight = 0.7
     default_subset = "all"  # choices: "mc", "tf", "all"
+    checkpoint_every = 5     # write a partial CSV every N questions (crash safety)
 
     # ==========================================
     # 3. Reranking Parameters (advanced_retriever.py)
@@ -37,14 +46,22 @@ class RAGConfig:
     # rag_config.py
     
     rerank_model_name = 'BAAI/bge-reranker-v2-m3'
-    
+    rerank_max_chars = 1000   # max chars of each passage fed to the cross-encoder
+    rerank_min_prob = 0.05    # drop reranked passages below this probability
+
+    _rerank_device_cache = None
+
     @property
     def rerank_device(self):
-        try:
-            import torch
-            return 'cuda' if torch.cuda.is_available() else 'cpu'
-        except ImportError:
-            return 'cpu'
+        # Cache the (expensive) torch import + cuda probe; this property is read
+        # many times per run.
+        if RAGConfig._rerank_device_cache is None:
+            try:
+                import torch
+                RAGConfig._rerank_device_cache = 'cuda' if torch.cuda.is_available() else 'cpu'
+            except ImportError:
+                RAGConfig._rerank_device_cache = 'cpu'
+        return RAGConfig._rerank_device_cache
 
     # ==========================================
     # 4. LLM & Evaluation Parameters (llm_utils.py)
@@ -66,6 +83,10 @@ class RAGConfig:
     web_max_page_chars = 25000
     web_chunk_chars = 2000
     web_chunk_overlap = 200
+
+    # Cap sentence-level passages kept per web/PubMed source so the cross-encoder
+    # rerank pool (local + web) does not explode on CPU.
+    web_max_sentences_per_source = 12
 
     web_trigger_min_local_passages = 3
 

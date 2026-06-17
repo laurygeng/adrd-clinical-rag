@@ -116,8 +116,35 @@ class WebFallbackRetriever:
     # ==========================================
     # PubMed API
     # ==========================================
+    def _parse_pubmed_abstracts(self, xml_text: str) -> Dict[str, str]:
+        """Map PMID -> abstract text from an efetch XML payload.
+
+        Uses the builtin html.parser (no lxml dependency); with html.parser the
+        tag names are lowercased, so we look for <pubmedarticle>/<pmid>/<abstracttext>.
+        """
+        out: Dict[str, str] = {}
+        if not xml_text or not BeautifulSoup:
+            return out
+        try:
+            soup = BeautifulSoup(xml_text, "html.parser")
+            for art in soup.find_all("pubmedarticle"):
+                pmid_tag = art.find("pmid")
+                pmid = pmid_tag.get_text(strip=True) if pmid_tag else None
+                if not pmid:
+                    continue
+                # An abstract may be split into several labeled <AbstractText> sections.
+                parts = [t.get_text(" ", strip=True) for t in art.find_all("abstracttext")]
+                text = _clean_whitespace(" ".join(p for p in parts if p))
+                if text:
+                    out[pmid] = text
+        except Exception:
+            pass
+        return out
+
     def pubmed_fetch_abstracts(self, query: str, max_results: int = 3) -> List[Tuple[str, str]]:
-        key = f"pubmed_search_v3::{max_results}::{query}" # Upgraded to v3 to forcefully bypass old corrupted cache
+        # v4: fetch the real abstract body via efetch (free, no API key required),
+        # instead of only the title via esummary.
+        key = f"pubmed_abstract_v4::{max_results}::{query}"
         cached = self._cache_get(key)
         # [Fix]: Strictly prohibit the use of empty caches
         if cached and "items" in cached and cached["items"]:
@@ -129,20 +156,31 @@ class WebFallbackRetriever:
             params = {"db": "pubmed", "term": query, "retmode": "json", "retmax": str(max_results)}
             search_resp = requests.get(search_url, params=params, timeout=self.timeout_sec).json()
             id_list = search_resp.get("esearchresult", {}).get("idlist", [])
-            
+
             if id_list:
                 ids_str = ",".join(id_list)
-                fetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
-                fetch_params = {"db": "pubmed", "id": ids_str, "retmode": "json"}
-                fetch_resp = requests.get(fetch_url, params=fetch_params, timeout=self.timeout_sec).json()
-                summaries = fetch_resp.get("result", {})
-                
+                # Titles (for labeling) via esummary
+                sum_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+                sum_params = {"db": "pubmed", "id": ids_str, "retmode": "json"}
+                summaries = requests.get(sum_url, params=sum_params, timeout=self.timeout_sec).json().get("result", {})
+
+                # Real abstract bodies via efetch (XML)
+                fetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+                fetch_params = {"db": "pubmed", "id": ids_str, "rettype": "abstract", "retmode": "xml"}
+                fetch_xml = requests.get(fetch_url, params=fetch_params, timeout=self.timeout_sec).text
+                abstracts = self._parse_pubmed_abstracts(fetch_xml)
+
                 for pid in id_list:
-                    item = summaries.get(pid, {})
-                    title = item.get("title", "")
+                    title = summaries.get(pid, {}).get("title", "")
+                    abstract = abstracts.get(pid, "")
+                    if not (title or abstract):
+                        continue
                     source_url = f"https://pubmed.ncbi.nlm.nih.gov/{pid}/"
-                    if title:
-                        results.append((source_url, f"PubMed Direct Evidence: {title}"))
+                    body = f"{title}. {abstract}".strip() if abstract else title
+                    results.append((source_url, body))
+
+                # Be polite to NCBI's free endpoint (<=3 req/s without an API key)
+                time.sleep(self.sleep_sec)
         except Exception:
             pass
 
@@ -226,21 +264,24 @@ class WebFallbackRetriever:
             
         return text_clean
 
-    def retrieve(self, queries: List[str], per_query_k: int = 5, max_page_chars: int = 25000, chunk_chars: int = 2000, chunk_overlap: int = 200) -> Tuple[List[str], List[str]]:
+    def retrieve(self, queries: List[str], per_query_k: int = 5, max_page_chars: int = 25000,
+                 chunk_chars: int = 2000, chunk_overlap: int = 200,
+                 max_sentences_per_source: int = 12) -> Tuple[List[str], List[str]]:
         passages = []
         sources = []
         seen_src = set()
 
         for q in queries:
             if not q.strip(): continue
-            
+
             # 1) PubMed Direct Summary
             try:
                 pubmed_data = self.pubmed_fetch_abstracts(q, max_results=per_query_k)
                 for src, txt in pubmed_data:
                     if src in seen_src: continue
                     seen_src.add(src)
-                    for s_chunk in _chunk_text_by_sentences(txt, max_chars=max_page_chars):
+                    # Cap sentences per source so the downstream rerank pool stays bounded.
+                    for s_chunk in _chunk_text_by_sentences(txt, max_chars=max_page_chars)[:max_sentences_per_source]:
                         passages.append(s_chunk)
                         sources.append(src)
             except Exception:
@@ -251,12 +292,12 @@ class WebFallbackRetriever:
                 for u in self.ddg_search_urls(q, max_results=per_query_k):
                     if u in seen_src: continue
                     if not _allowed(u, self.allow_domains): continue
-                    
+
                     txt = self.fetch_page_text(u, max_chars=max_page_chars)
                     if not txt: continue
-                        
+
                     seen_src.add(u)
-                    for s_chunk in _chunk_text_by_sentences(txt, max_chars=max_page_chars):
+                    for s_chunk in _chunk_text_by_sentences(txt, max_chars=max_page_chars)[:max_sentences_per_source]:
                         passages.append(s_chunk)
                         sources.append(u)
             except Exception:

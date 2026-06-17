@@ -1,5 +1,6 @@
 import openai
 import os
+import time
 from rag_config import config
 
 def get_openai_client():
@@ -7,6 +8,22 @@ def get_openai_client():
     base_url = os.environ.get("OPENAI_BASE_URL")
     client = openai.OpenAI(api_key=api_key, base_url=base_url) if base_url else openai.OpenAI(api_key=api_key)
     return client
+
+def _chat_with_retry(client, *, max_retries=3, base_delay=1.5, **kwargs):
+    """Call chat.completions.create with exponential backoff on transient errors.
+
+    Raises the last exception if all attempts fail, so callers keep their own
+    try/except (and their safe defaults) for the terminal failure case.
+    """
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as e:
+            last_err = e
+            if attempt < max_retries - 1:
+                time.sleep(base_delay * (2 ** attempt))
+    raise last_err
 
 def evaluate_context(original_question, retrieved_contexts, model=None):
     """
@@ -27,7 +44,8 @@ def evaluate_context(original_question, retrieved_contexts, model=None):
         "retrieved_contexts": retrieved_contexts
     }
     try:
-        response = client.chat.completions.create(
+        response = _chat_with_retry(
+            client,
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -36,10 +54,12 @@ def evaluate_context(original_question, retrieved_contexts, model=None):
             response_format={"type": "json_object"}
         )
         content = response.choices[0].message.content
-        return content if content else '{"status": "answerable", "missing_information": "", "reasoning": ""}'
+        # Fail "unanswerable" (not "answerable") so an API/empty failure does NOT
+        # masquerade as sufficient context and silently skip the web fallback.
+        return content if content else '{"status": "unanswerable", "missing_information": "Local evaluation returned empty (API issue); attempt external retrieval.", "reasoning": "API returned empty"}'
     except Exception as e:
         print(f"Evaluate Context API failed: {e}")
-        return '{"status": "answerable", "missing_information": "", "reasoning": ""}'
+        return '{"status": "unanswerable", "missing_information": "Local evaluation failed (API error); attempt external retrieval.", "reasoning": "API error"}'
 
 def rewrite_tf_query(statement, model=None):
     """
@@ -60,7 +80,8 @@ def rewrite_tf_query(statement, model=None):
         " — 2 to 4 queries total, NO duplicates."
     )
     try:
-        response = client.chat.completions.create(
+        response = _chat_with_retry(
+            client,
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -97,7 +118,8 @@ def evaluate_tf_evidence(statement, retrieved_contexts, model=None):
     context_str = "\n\n".join([f"[{i}] {p}" for i, p in enumerate(retrieved_contexts)])
     user_content = f"Statement: {statement}\n\nRetrieved Passages:\n{context_str}"
     try:
-        response = client.chat.completions.create(
+        response = _chat_with_retry(
+            client,
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -133,7 +155,8 @@ def decompose_mc_options(stem, options_dict, model=None):
     options_str = "\n".join([f"{k}. {v}" for k, v in options_dict.items()])
     user_content = f"Stem: {stem}\nOptions:\n{options_str}"
     try:
-        response = client.chat.completions.create(
+        response = _chat_with_retry(
+            client,
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -185,7 +208,8 @@ def generate_web_queries_from_missing_info(original_question, missing_informatio
     user_content = f"Original Query: {original_question}\nMissing Information: {missing_information}"
     
     try:
-        response = client.chat.completions.create(
+        response = _chat_with_retry(
+            client,
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},

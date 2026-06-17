@@ -193,13 +193,25 @@ class IncrementalIngestionPipeline:
         if new_vector_docs:
             print(f"🔗 Embedding and pushing {len(new_vector_docs)} new chunks to ChromaDB...")
             client = chromadb.PersistentClient(path=self.chroma_persist_dir)
-            collection = client.get_or_create_collection("braincheck_advanced")
-            
+            # Match the embedding space to BGE's recommended setup. NOTE: hnsw:space is
+            # fixed at collection creation — to switch an existing l2 collection to cosine
+            # you must delete braincheck_vectordb and re-ingest from scratch.
+            collection = client.get_or_create_collection(
+                "braincheck_advanced",
+                metadata={"hnsw:space": getattr(config, "embed_space", "cosine")},
+            )
+
             from sentence_transformers import SentenceTransformer
             embed_model = SentenceTransformer(config.embed_model_name)
-            
+
             texts = [d.page_content for d in new_vector_docs]
-            embeddings = embed_model.encode(texts, show_progress_bar=True).tolist()
+            # L2-normalize passage vectors so cosine similarity is well defined and
+            # consistent with the normalized query embeddings used at retrieval time.
+            embeddings = embed_model.encode(
+                texts,
+                show_progress_bar=True,
+                normalize_embeddings=getattr(config, "embed_normalize", True),
+            ).tolist()
             ids = [str(d.metadata.get('child_id')) for d in new_vector_docs]
             metadatas = [d.metadata for d in new_vector_docs]
             
