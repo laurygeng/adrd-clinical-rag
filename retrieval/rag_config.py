@@ -90,6 +90,27 @@ class RAGConfig:
 
     web_trigger_min_local_passages = 3
 
+    # Domain policy for web fallback:
+    #   "allowlist" = only fetch from web_allow_domains (strict, original behavior)
+    #   "blocklist" = fetch from ANY domain except web_block_domains (open; rely on the
+    #                 cross-encoder rerank to reject topically-irrelevant noise)
+    web_domain_mode = "blocklist"
+    web_block_domains = [
+        # social / UGC
+        "facebook.com", "m.facebook.com", "twitter.com", "x.com", "instagram.com",
+        "tiktok.com", "youtube.com", "youtu.be", "reddit.com", "pinterest.com",
+        "linkedin.com", "quora.com", "tumblr.com", "threads.net", "medium.com",
+        # commerce / ads / SEO farms / doc dumps
+        "amazon.com", "ebay.com", "walmart.com", "etsy.com", "yelp.com",
+        "answers.com", "ehow.com", "slideshare.net", "scribd.com", "coursehero.com",
+        "pinterest.co.uk",
+    ]
+
+    # TF web-verification gate: when a TF verdict IS reached but its confidence is below
+    # this level, still trigger web verification + re-judge (instead of trusting it blindly).
+    # One of: "high" | "medium" | "low". "high" => verify everything not high-confidence.
+    tf_web_verify_below = "high"
+
     web_allow_domains = [
         "nia.nih.gov",
         "nih.gov",

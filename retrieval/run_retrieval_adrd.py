@@ -19,6 +19,13 @@ def passage_id(src, text):
     """Stable dedup id (builtin hash() is process-salted and not reproducible)."""
     return f"{src}__{hashlib.md5(text.encode('utf-8')).hexdigest()}"
 
+
+_CONF_RANK = {"low": 0, "medium": 1, "high": 2}
+
+def conf_meets(conf, threshold):
+    """True if a TF confidence level is >= the verify threshold (so it can SKIP web)."""
+    return _CONF_RANK.get(str(conf).lower(), 0) >= _CONF_RANK.get(str(threshold).lower(), 2)
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from rag_config import config
@@ -85,6 +92,7 @@ def main():
     parser.add_argument("--pre_k", type=int, default=getattr(config, "retrieval_pre_k", 100), help="Candidates before reranking")
     parser.add_argument("--window", type=int, default=getattr(config, "retrieval_window_size", 800), help="Context window expansion")
     parser.add_argument("--subset", choices=["mc", "tf", "all"], default=getattr(config, "default_subset", "all"), help="Subset to retrieve")
+    parser.add_argument("--ids", type=str, default=None, help="Comma-separated Question_IDs to retrieve (subset for fast validation). Overrides --subset filtering to these IDs.")
     args = parser.parse_args()
 
     print("🔧 Initializing AdvancedRetriever (Local)...")
@@ -95,9 +103,15 @@ def main():
         cache_dir=getattr(config, "web_cache_dir", os.path.join(PROJECT_ROOT, "knowledge_base", "web_cache")),
         timeout_sec=getattr(config, "web_timeout_sec", 20),
         sleep_sec=getattr(config, "web_sleep_sec", 0.2),
+        domain_mode=getattr(config, "web_domain_mode", "allowlist"),
+        block_domains=getattr(config, "web_block_domains", []),
     )
 
     questions = load_adrd_bench_questions(subset=args.subset)
+    if args.ids:
+        wanted = {x.strip() for x in args.ids.split(",") if x.strip()}
+        questions = [q for q in questions if q["Question_ID"] in wanted]
+        print(f"🎯 Subset filter: {len(questions)} of requested {len(wanted)} IDs matched.")
     os.makedirs(os.path.join(PROJECT_ROOT, "retrieval_results"), exist_ok=True)
     output_path = os.path.join(PROJECT_ROOT, "retrieval_results", f"retrieval_ADRD_{args.subset}_LOCAL_WEB_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
 
@@ -160,6 +174,7 @@ def main():
 
         # STEP 4: Local Evaluation
         tf_verdict, satisfied = None, False
+        tf_confidence = None
         raw_eval, eval_missing = None, ""
 
         if q_type == "TF" and retrieved_contexts:
@@ -167,6 +182,7 @@ def main():
                 raw_eval = evaluate_tf_evidence(original_question, retrieved_contexts)
                 tf_eval = json.loads(clean_json_string(raw_eval))
                 tf_verdict = tf_eval.get("verdict", "insufficient")
+                tf_confidence = tf_eval.get("confidence", "low")
                 satisfied = tf_verdict in ("True", "False")
                 eval_missing = tf_eval.get("missing_information", "")
             except Exception as e:
@@ -188,8 +204,17 @@ def main():
 
         web_enabled = getattr(config, "web_enabled", False)
         web_rounds = getattr(config, "web_max_rounds", 2)
+        verify_below = getattr(config, "tf_web_verify_below", "high")
 
-        if (not satisfied) and web_enabled:
+        # TF gate: a reached-but-not-high-confidence verdict should ALSO trigger web
+        # verification, not be trusted blindly (this was the #1 source of "satisfied
+        # but wrong" TF errors). MC keeps the original "unanswerable -> web" trigger.
+        def need_web():
+            if q_type == "TF":
+                return (not satisfied) or (not conf_meets(tf_confidence, verify_below))
+            return not satisfied
+
+        if need_web() and web_enabled:
             for _round in range(web_rounds):
                 if eval_missing:
                     try:
@@ -244,6 +269,7 @@ def main():
                         raw_eval = evaluate_tf_evidence(original_question, retrieved_contexts)
                         tf_eval = json.loads(clean_json_string(raw_eval))
                         tf_verdict = tf_eval.get("verdict", "insufficient")
+                        tf_confidence = tf_eval.get("confidence", "low")
                         satisfied = tf_verdict in ("True", "False")
                         eval_missing = tf_eval.get("missing_information", "")
                     except Exception as e:
@@ -257,9 +283,12 @@ def main():
                     except Exception as e:
                         pass
 
-                if satisfied: break
+                # Stop early only once the answer is solid: MC answerable, or TF decided
+                # AND high-enough confidence. A decided-but-low-confidence TF keeps verifying.
+                if not need_web():
+                    break
 
-        print(f"📄 [{question_id}] passages={len(retrieved_contexts)} satisfied={satisfied}" + (f" tf_verdict={tf_verdict}" if q_type == "TF" else "") + f" web_used={web_used}")
+        print(f"📄 [{question_id}] passages={len(retrieved_contexts)} satisfied={satisfied}" + (f" tf_verdict={tf_verdict}({tf_confidence})" if q_type == "TF" else "") + f" web_used={web_used}")
 
         results.append({
             "Question_ID": question_id, "Type": q_type,
@@ -267,7 +296,7 @@ def main():
             "Correct_Letter": item["Correct_Letter"],
             "Retrieved_Passages": json.dumps(retrieved_contexts, ensure_ascii=False),
             "Retrieved_Sources": json.dumps(sources, ensure_ascii=False),
-            "Satisfied": satisfied, "TF_Verdict": tf_verdict,
+            "Satisfied": satisfied, "TF_Verdict": tf_verdict, "TF_Confidence": tf_confidence,
             "Eval_Missing_Information": eval_missing, "Web_Used": web_used,
             "Web_Queries": json.dumps(web_queries_used, ensure_ascii=False),
             "Web_Sources": json.dumps(list(dict.fromkeys(web_sources_used))[:30], ensure_ascii=False),

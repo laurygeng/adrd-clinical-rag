@@ -80,13 +80,30 @@ class WebFallbackRetriever:
     Enhanced research-only fallback retriever with PubMed Direct Integration,
     Anti-Bot web scraping, and Sentence-Level high-purity chunking.
     """
-    def __init__(self, allow_domains=None, cache_dir: str = "", timeout_sec: int = 20, sleep_sec: float = 0.5):
+    def __init__(self, allow_domains=None, cache_dir: str = "", timeout_sec: int = 20, sleep_sec: float = 0.5,
+                 domain_mode: str = "allowlist", block_domains=None):
         self.allow_domains = allow_domains or []
+        self.block_domains = block_domains or []
+        self.domain_mode = domain_mode
         self.cache_dir = cache_dir
         self.timeout_sec = timeout_sec
         self.sleep_sec = sleep_sec
         if self.cache_dir:
             os.makedirs(self.cache_dir, exist_ok=True)
+
+    def _is_allowed(self, url: str) -> bool:
+        """Domain gate. blocklist mode: allow any real domain not on the block list;
+        allowlist mode: only domains on the allow list."""
+        d = _domain(url)
+        if not d:
+            return False
+        if self.domain_mode == "blocklist":
+            for bd in self.block_domains:
+                bd = bd.lower()
+                if d == bd or d.endswith("." + bd):
+                    return False
+            return True
+        return _allowed(url, self.allow_domains)
 
     # -------- Cache Management --------
     def _cache_path(self, key: str) -> str:
@@ -291,7 +308,7 @@ class WebFallbackRetriever:
             try:
                 for u in self.ddg_search_urls(q, max_results=per_query_k):
                     if u in seen_src: continue
-                    if not _allowed(u, self.allow_domains): continue
+                    if not self._is_allowed(u): continue
 
                     txt = self.fetch_page_text(u, max_chars=max_page_chars)
                     if not txt: continue

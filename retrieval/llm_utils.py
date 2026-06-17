@@ -109,11 +109,13 @@ def evaluate_tf_evidence(statement, retrieved_contexts, model=None):
         "1. Read the statement and all passages carefully.\n"
         "2. Identify if the passages contain explicit evidence OR clinically synonymous concepts that logically support or refute the statement. "
         "Basic logical synthesis across multiple passages is allowed, but strictly DO NOT hallucinate or use outside knowledge.\n"
-        "3. Output a JSON object with four keys:\n"
+        "3. Output a JSON object with five keys:\n"
         "   - 'reasoning': A brief step-by-step explanation of how the text connects to the statement.\n"
         "   - 'evidence': The exact quotes from the text that support your reasoning.\n"
         "   - 'verdict': Must be exactly 'True', 'False', or 'insufficient'. Use 'insufficient' ONLY if the topic is entirely missing or unanswerable from the text.\n"
-        "   - 'missing_information': If verdict is 'insufficient', state exactly what specific factual data is missing to verify the claim. If sufficient, leave empty."
+        "   - 'confidence': Must be exactly 'high', 'medium', or 'low'. Use 'high' ONLY when the passages contain explicit, direct evidence that settles the statement; "
+        "'medium' when the verdict rests on inference or partial evidence; 'low' when evidence is weak, indirect, or barely related.\n"
+        "   - 'missing_information': If verdict is 'insufficient' OR confidence is not 'high', state exactly what specific additional factual evidence would confirm or refute the claim. Otherwise leave empty."
     )
     context_str = "\n\n".join([f"[{i}] {p}" for i, p in enumerate(retrieved_contexts)])
     user_content = f"Statement: {statement}\n\nRetrieved Passages:\n{context_str}"
@@ -128,10 +130,10 @@ def evaluate_tf_evidence(statement, retrieved_contexts, model=None):
             response_format={"type": "json_object"}
         )
         content = response.choices[0].message.content
-        return content if content else '{"verdict": "insufficient", "evidence": "", "reasoning": "API returned empty", "missing_information": "API Failure"}'
+        return content if content else '{"verdict": "insufficient", "confidence": "low", "evidence": "", "reasoning": "API returned empty", "missing_information": "API Failure"}'
     except Exception as e:
         print(f"evaluate_tf_evidence API failed: {e}")
-        return '{"verdict": "insufficient", "evidence": "", "reasoning": "API error", "missing_information": "API Error"}'
+        return '{"verdict": "insufficient", "confidence": "low", "evidence": "", "reasoning": "API error", "missing_information": "API Error"}'
 
 def decompose_mc_options(stem, options_dict, model=None):
     """
