@@ -171,6 +171,7 @@ Supported file types: .pdf, .docx, .txt
             '.pdf': chosen_pdf_loader,
             '.docx': Docx2txtLoader,
             '.txt': TextLoader,
+            '.md': TextLoader,   # markdown is plain text; MarkdownHeaderTextSplitter parses its # headers downstream
         }
         
         # Optional cap for quick smoke tests
