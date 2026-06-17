@@ -35,7 +35,7 @@ class RAGConfig:
     bm25_weight = 0.3
     vector_weight = 0.7
     default_subset = "all"  # choices: "mc", "tf", "all"
-    checkpoint_every = 5     # write a partial CSV every N questions (crash safety)
+    checkpoint_every = 20    # write a partial CSV every N questions (crash safety / progress review)
 
     # ==========================================
     # 3. Reranking Parameters (advanced_retriever.py)
