@@ -184,3 +184,15 @@ class AdvancedRetriever:
                     final_sources.append(src)
 
         return final_contents, final_scores, final_sources
+    
+    
+    def rerank_texts(self, query: str, passages: List[str], sources: List[str]):
+        """
+        Rerank arbitrary passages (e.g., web passages) using the same CrossEncoder.
+        Returns (sorted_passages, sorted_sources, sorted_scores_logits)
+        """
+        if not passages:
+            return [], [], []
+        dummy_ids = [str(i) for i in range(len(passages))]
+        sorted_texts, sorted_s, _, sorted_scores = self._rerank_passages(query, passages, sources, dummy_ids)
+        return sorted_texts, sorted_s, sorted_scores

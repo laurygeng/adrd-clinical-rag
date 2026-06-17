@@ -77,6 +77,7 @@ def rewrite_tf_query(statement, model=None):
 def evaluate_tf_evidence(statement, retrieved_contexts, model=None):
     """
     TF evaluator with Chain of Thought (CoT) and clinical synonym mapping mechanisms.
+    Now supports extracting 'missing_information' for downstream web fallback.
     """
     if model is None: model = config.llm_eval_model
     client = get_openai_client()
@@ -87,10 +88,11 @@ def evaluate_tf_evidence(statement, retrieved_contexts, model=None):
         "1. Read the statement and all passages carefully.\n"
         "2. Identify if the passages contain explicit evidence OR clinically synonymous concepts that logically support or refute the statement. "
         "Basic logical synthesis across multiple passages is allowed, but strictly DO NOT hallucinate or use outside knowledge.\n"
-        "3. Output a JSON object with three keys:\n"
+        "3. Output a JSON object with four keys:\n"
         "   - 'reasoning': A brief step-by-step explanation of how the text connects to the statement.\n"
         "   - 'evidence': The exact quotes from the text that support your reasoning.\n"
-        "   - 'verdict': Must be exactly 'True', 'False', or 'insufficient'. Use 'insufficient' ONLY if the topic is entirely missing or unanswerable from the text."
+        "   - 'verdict': Must be exactly 'True', 'False', or 'insufficient'. Use 'insufficient' ONLY if the topic is entirely missing or unanswerable from the text.\n"
+        "   - 'missing_information': If verdict is 'insufficient', state exactly what specific factual data is missing to verify the claim. If sufficient, leave empty."
     )
     context_str = "\n\n".join([f"[{i}] {p}" for i, p in enumerate(retrieved_contexts)])
     user_content = f"Statement: {statement}\n\nRetrieved Passages:\n{context_str}"
@@ -104,10 +106,10 @@ def evaluate_tf_evidence(statement, retrieved_contexts, model=None):
             response_format={"type": "json_object"}
         )
         content = response.choices[0].message.content
-        return content if content else '{"verdict": "insufficient", "evidence": "", "reasoning": "API returned empty"}'
+        return content if content else '{"verdict": "insufficient", "evidence": "", "reasoning": "API returned empty", "missing_information": "API Failure"}'
     except Exception as e:
         print(f"evaluate_tf_evidence API failed: {e}")
-        return '{"verdict": "insufficient", "evidence": "", "reasoning": "API error"}'
+        return '{"verdict": "insufficient", "evidence": "", "reasoning": "API error", "missing_information": "API Error"}'
 
 def decompose_mc_options(stem, options_dict, model=None):
     """
@@ -144,3 +146,55 @@ def decompose_mc_options(stem, options_dict, model=None):
     except Exception as e:
         print(f"decompose_mc_options API failed: {e}")
         return '{"option_queries": {}}'
+
+def generate_web_queries_from_missing_info(original_question, missing_information, q_type="MC", model=None):
+    """
+    Generate targeted web search queries based on missing info.
+    Optimized for general web search engines (like DuckDuckGo) without strict Boolean operators.
+    """
+    if not missing_information:
+        return '{"queries": []}'
+        
+    if model is None: model = config.llm_rewrite_model
+    client = get_openai_client()
+    
+    system_prompt = (
+        "You are an expert search query generator for medical RAG systems specializing in Alzheimer's Disease and Related Dementias (ADRD). "
+        "Your goal is to generate search queries to retrieve missing factual information from a general web search engine (like Google or DuckDuckGo).\n\n"
+    )
+    
+    if q_type == "TF":
+        system_prompt += (
+            "The original query is a True/False claim. Local retrieval returned 'insufficient'.\n"
+            "STRATEGY:\n"
+            "1. DECOMPOSE the statement into 1-2 atomic clinical claims based on the missing information.\n"
+            "2. Generate 1-2 broad, Google-friendly search queries (natural language or 3-4 loose keywords) targeting the missing evidence.\n"
+            "3. Do NOT use Boolean operators (AND/OR) or quotes. Keep it simple for a generic web crawler to find medical articles.\n"
+        )
+    else:
+        system_prompt += (
+            "The original query is a Multiple Choice question. Local retrieval lacked specific facts.\n"
+            "STRATEGY:\n"
+            "1. Analyze the exact 'missing information' identified.\n"
+            "2. Generate 1-2 simple, Google-friendly keyword queries targeting the missing facts.\n"
+            "3. Do NOT use Boolean operators (AND/OR) or quotes. Use simple descriptive keywords that a standard search engine can easily match.\n"
+        )
+        
+    system_prompt += "Output MUST be strictly JSON format: {\"queries\": [\"query1\", \"query2\"]}"
+    
+    user_content = f"Original Query: {original_question}\nMissing Information: {missing_information}"
+    
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ],
+            response_format={"type": "json_object"}
+        )
+        content = response.choices[0].message.content
+        return content if content else '{"queries": []}'
+    except Exception as e:
+        print(f"generate_web_queries_from_missing_info API failed: {e}")
+        return '{"queries": []}'
