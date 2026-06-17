@@ -88,13 +88,21 @@ class RAGConfig:
     # rerank pool (local + web) does not explode on CPU.
     web_max_sentences_per_source = 12
 
+    # Guard: after merging local+web and reranking, reserve at least this many of the
+    # final top_k slots for LOCAL passages (when enough exist), so high-scoring web
+    # sentences cannot completely flood out the answer-bearing local context.
+    web_final_local_floor = 8
+
     web_trigger_min_local_passages = 3
 
     # Domain policy for web fallback:
     #   "allowlist" = only fetch from web_allow_domains (strict, original behavior)
     #   "blocklist" = fetch from ANY domain except web_block_domains (open; rely on the
     #                 cross-encoder rerank to reject topically-irrelevant noise)
-    web_domain_mode = "blocklist"
+    # NOTE: full "blocklist" (open) mode was tested and REGRESSED MC by -5 — open domains
+    # flooded the rerank with marketing/SEO blogs that displaced good local context
+    # (e.g. MC_026 ended up 0 local / 20 web). Reverted to a curated allowlist.
+    web_domain_mode = "allowlist"
     web_block_domains = [
         # social / UGC
         "facebook.com", "m.facebook.com", "twitter.com", "x.com", "instagram.com",
@@ -127,6 +135,17 @@ class RAGConfig:
         "hopkinsmedicine.org",  # 约翰霍普金斯
         "alzdiscovery.org",     # 阿尔茨海默症药物发现基金会
         "dementia.org",         # 痴呆症专题宣教网站
+        # Curated reputable caregiving/health additions (vetted from the open-domain run):
+        "alzheimers.org.uk",    # Alzheimer's Society UK
+        "dementiauk.org",       # Dementia UK
+        "nccdp.org",            # National Council of Certified Dementia Practitioners
+        "nia.nih.gov",          # National Institute on Aging
+        "agingcare.com",        # 照护问答（编辑审核）
+        "dailycaring.com",      # 照护实操（编辑审核）
+        "verywellhealth.com",   # 医学审核科普
+        "healthline.com",       # 医学审核科普
+        "nhs.uk",               # UK National Health Service
+        "caregiver.org",        # Family Caregiver Alliance
     ]
 
 config = RAGConfig()

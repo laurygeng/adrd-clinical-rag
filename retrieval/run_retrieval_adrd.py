@@ -249,13 +249,31 @@ def main():
                         original_question, merged_passages, merged_sources
                     )
 
+                    # Reserve at least `local_floor` of the top_k slots for local passages
+                    # so high-scoring web sentences can't completely flood out the local
+                    # answer context. Web above the cap is deferred and only used to fill
+                    # leftover slots if local runs out.
+                    local_floor = getattr(config, "web_final_local_floor", 0)
+                    web_cap = max(0, args.top_k - local_floor)
                     retrieved_contexts, sources, scores, retrieved_chunk_ids = [], [], [], set()
+                    web_count, deferred_web = 0, []
                     for p, src, lg in zip(reranked_passages, reranked_sources, reranked_logits):
                         if len(retrieved_contexts) >= args.top_k: break
                         pid = passage_id(src, p)
                         if pid in retrieved_chunk_ids: continue
-                        
                         retrieved_chunk_ids.add(pid)
+                        is_web = str(src).startswith("http")
+                        if is_web and web_count >= web_cap:
+                            deferred_web.append((p, src, lg))   # over cap: defer
+                            continue
+                        retrieved_contexts.append(p)
+                        sources.append(src)
+                        scores.append(logit_to_prob(lg))
+                        if is_web:
+                            web_count += 1
+                    # Fill any remaining slots with the deferred (over-cap) web passages.
+                    for p, src, lg in deferred_web:
+                        if len(retrieved_contexts) >= args.top_k: break
                         retrieved_contexts.append(p)
                         sources.append(src)
                         scores.append(logit_to_prob(lg))
