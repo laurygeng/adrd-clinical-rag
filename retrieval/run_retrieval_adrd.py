@@ -35,7 +35,9 @@ from llm_utils import (
     rewrite_tf_query,
     evaluate_tf_evidence,
     decompose_mc_options,
-    generate_web_queries_from_missing_info
+    generate_web_queries_from_missing_info,
+    generate_draft_query,
+    agentic_search_queries,
 )
 from web_fallback_retriever import WebFallbackRetriever
 
@@ -148,6 +150,17 @@ def main():
             except Exception:
                 queries = [original_question]
 
+        # STEP 1.5: FLARE/HyDE draft-then-retrieve — add hypothetical source-style answer
+        # sentences as extra queries to surface specific facts the question-query misses.
+        if getattr(config, "draft_retrieve_enabled", False):
+            try:
+                stem = item.get("Stem", "") if q_type == "MC" else original_question
+                draft_raw = generate_draft_query(stem, q_type, item.get("Options_Dict", {}))
+                draft_qs = [q for q in json.loads(clean_json_string(draft_raw)).get("queries", []) if q and q not in queries]
+                queries = queries + draft_qs
+            except Exception:
+                pass
+
         # STEP 2: Local retrieval pooling
         all_pool = []
         for q in queries:
@@ -214,9 +227,23 @@ def main():
                 return (not satisfied) or (not conf_meets(tf_confidence, verify_below))
             return not satisfied
 
+        agentic = getattr(config, "agentic_web_enabled", False)
         if need_web() and web_enabled:
             for _round in range(web_rounds):
-                if eval_missing:
+                if agentic:
+                    # Agentic: reflect on what's already retrieved + what's missing, then
+                    # issue refined/diverse queries for THIS round (different angle each round).
+                    try:
+                        wq_raw = agentic_search_queries(original_question, retrieved_contexts, eval_missing, q_type, _round)
+                        wq_res = json.loads(clean_json_string(wq_raw))
+                        generated_queries = [q for wq in wq_res.get("queries", []) if (q := wq.strip())]
+                        # round 0 also seeds with the original sub-queries; later rounds rely on fresh angles
+                        web_queries_used = generated_queries + ([q for q in queries if q not in generated_queries] if _round == 0 else [])
+                        if not web_queries_used:
+                            web_queries_used = list(queries)
+                    except Exception:
+                        web_queries_used = list(queries)
+                elif eval_missing:
                     try:
                         wq_raw = generate_web_queries_from_missing_info(original_question, eval_missing, q_type)
                         wq_res = json.loads(clean_json_string(wq_raw))
@@ -236,6 +263,14 @@ def main():
                 )
 
                 if not wp: break
+
+                # Web relevance pre-filter: keep only the top-N web sentences most relevant
+                # to the question before merging, dropping the marginally-relevant tail.
+                prefilter_keep = getattr(config, "web_prefilter_keep", 0)
+                if prefilter_keep and len(wp) > prefilter_keep and hasattr(retriever, "rerank_texts"):
+                    wp_s, ws_s, _ = retriever.rerank_texts(original_question, wp, ws)
+                    wp, ws = wp_s[:prefilter_keep], ws_s[:prefilter_keep]
+
                 web_used = True
                 web_sources_used.extend(ws)
 

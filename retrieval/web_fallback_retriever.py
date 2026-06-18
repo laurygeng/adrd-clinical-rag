@@ -50,6 +50,29 @@ def _allowed(url: str, allow_domains: List[str]) -> bool:
 def _clean_whitespace(t: str) -> str:
     return re.sub(r"\s+", " ", (t or "")).strip()
 
+# Boilerplate/navigation phrases common on scraped pages — these sentences carry no
+# medical content and only pollute the rerank pool.
+_JUNK_PATTERNS = re.compile(
+    r"(cookie|subscribe|sign\s?up|log\s?in|schedule a tour|search categories|"
+    r"all rights reserved|privacy policy|terms of (use|service)|skip to (content|main)|"
+    r"©|\bmenu\b|newsletter|follow us|share this|read more|click here|advertisement|"
+    r"accept all|your privacy|main navigation)",
+    re.IGNORECASE,
+)
+
+def _is_junk_sentence(s: str) -> bool:
+    """Heuristic filter for navigation/boilerplate web sentences."""
+    if "￼" in s or _JUNK_PATTERNS.search(s):     # replacement char or boilerplate phrase
+        return True
+    letters = [c for c in s if c.isalpha()]
+    if letters and sum(c.isupper() for c in letters) / len(letters) > 0.5:   # ALL-CAPS menu/header
+        return True
+    if sum(c.isalpha() or c.isspace() for c in s) / max(len(s), 1) < 0.6:    # too many symbols/punctuation
+        return True
+    if len(s.split()) < 4:                            # too few words to be a real claim
+        return True
+    return False
+
 def _chunk_text_by_sentences(text: str, max_chars: int = 15000) -> List[str]:
     """
     [Core Refactoring]: Utilize NLTK to tokenize web pages and abstracts into independent, 
@@ -68,10 +91,10 @@ def _chunk_text_by_sentences(text: str, max_chars: int = 15000) -> List[str]:
     clean_sentences = []
     for s in raw_sentences:
         s_clean = _clean_whitespace(s)
-        # Filter out overly short, meaningless characters or navigation bar residues
-        if len(s_clean) > 15:
+        # Filter out overly short / boilerplate / navigation sentences
+        if len(s_clean) > 15 and not _is_junk_sentence(s_clean):
             clean_sentences.append(s_clean)
-            
+
     return clean_sentences
 
 
@@ -287,6 +310,14 @@ class WebFallbackRetriever:
         passages = []
         sources = []
         seen_src = set()
+        seen_sent = set()   # near-duplicate sentence dedup (boilerplate repeats across pages)
+
+        def _dup(s):
+            key = re.sub(r"[^a-z0-9 ]", "", s.lower()).strip()[:160]
+            if key in seen_sent:
+                return True
+            seen_sent.add(key)
+            return False
 
         for q in queries:
             if not q.strip(): continue
@@ -299,6 +330,7 @@ class WebFallbackRetriever:
                     seen_src.add(src)
                     # Cap sentences per source so the downstream rerank pool stays bounded.
                     for s_chunk in _chunk_text_by_sentences(txt, max_chars=max_page_chars)[:max_sentences_per_source]:
+                        if _dup(s_chunk): continue
                         passages.append(s_chunk)
                         sources.append(src)
             except Exception:
@@ -315,6 +347,7 @@ class WebFallbackRetriever:
 
                     seen_src.add(u)
                     for s_chunk in _chunk_text_by_sentences(txt, max_chars=max_page_chars)[:max_sentences_per_source]:
+                        if _dup(s_chunk): continue
                         passages.append(s_chunk)
                         sources.append(u)
             except Exception:

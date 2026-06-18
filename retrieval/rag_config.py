@@ -30,7 +30,7 @@ class RAGConfig:
     # 2. Retrieval Parameters (run_retrieval_adrd.py)
     # ==========================================
     retrieval_top_k = 20
-    retrieval_pre_k = 100
+    retrieval_pre_k = 30     # candidate pool per query before rerank (was 100; 30 holds accuracy, much faster)
     retrieval_window_size = 800
     bm25_weight = 0.3
     vector_weight = 0.7
@@ -48,6 +48,19 @@ class RAGConfig:
     rerank_model_name = 'BAAI/bge-reranker-v2-m3'
     rerank_max_chars = 1000   # max chars of each passage fed to the cross-encoder
     rerank_min_prob = 0.05    # drop reranked passages below this probability
+
+    # CRAG decompose-then-recompose (knowledge-strip refinement): split each final
+    # passage into sentences, cross-encoder-score each against the query, keep only the
+    # top strips (in original order). Denoises long passages so the answer sentence is
+    # not buried and reduces flood/distraction before generation.
+    strip_refine_enabled = False  # opt-in. TESTED net -2 (over-trims context) — leave off.
+    strip_keep_top = 3            # max sentences kept per passage
+    strip_min_prob = 0.02         # also keep any sentence above this relevance prob
+
+    # FLARE/HyDE draft-then-retrieve: also retrieve using a hypothetical source-style
+    # answer sentence (not just the question), to surface specific facts the generic
+    # question-query misses. Opt-in (env-toggleable for A/B): validate before a full run.
+    draft_retrieve_enabled = os.environ.get("DRAFT_RETRIEVE", "0") == "1"
 
     _rerank_device_cache = None
 
@@ -74,8 +87,9 @@ class RAGConfig:
     # 5. Web fallback retrieval (FREE, research-only)
     # ==========================================
     web_enabled = True
-    web_max_rounds = 2
-    web_per_query_k = 5
+    web_max_rounds = 2          # (agentic multi-round supports up to N; 3 broadening gave no gain on DDG)
+    web_per_query_k = 5         # (8 + open domains broadening gave no gain on DDG — reverted)
+    agentic_web_enabled = False # reflective gap-targeted queries; off until a stronger search backend
     web_timeout_sec = 20
     web_sleep_sec = 0.2
     web_cache_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../knowledge_base/web_cache"))
@@ -93,15 +107,21 @@ class RAGConfig:
     # sentences cannot completely flood out the answer-bearing local context.
     web_final_local_floor = 8
 
+    # Web relevance pre-filter: before merging web with local, rerank the web sentences
+    # against the question and keep only the top-N most relevant — drops the long tail of
+    # marginally-relevant scraped sentences so they can't dilute the merged rerank pool.
+    web_prefilter_keep = 20
+
     web_trigger_min_local_passages = 3
 
     # Domain policy for web fallback:
     #   "allowlist" = only fetch from web_allow_domains (strict, original behavior)
     #   "blocklist" = fetch from ANY domain except web_block_domains (open; rely on the
     #                 cross-encoder rerank to reject topically-irrelevant noise)
-    # NOTE: full "blocklist" (open) mode was tested and REGRESSED MC by -5 — open domains
-    # flooded the rerank with marketing/SEO blogs that displaced good local context
-    # (e.g. MC_026 ended up 0 local / 20 web). Reverted to a curated allowlist.
+    # Curated allowlist. Full-open "blocklist" mode was tested both before and after the
+    # web-quality filters and gave no net gain (the DuckDuckGo backend is the limiter, not
+    # the domain set — see experiments log). Kept "blocklist" available for when a stronger
+    # search backend is wired in.
     web_domain_mode = "allowlist"
     web_block_domains = [
         # social / UGC

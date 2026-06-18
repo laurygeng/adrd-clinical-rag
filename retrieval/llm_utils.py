@@ -95,6 +95,90 @@ def rewrite_tf_query(statement, model=None):
         print(f"rewrite_tf_query API failed: {e}")
         return '{"queries": []}'
 
+def generate_draft_query(question, q_type="TF", options_dict=None, model=None):
+    """FLARE/HyDE-style draft-then-retrieve: generate a short hypothetical source-style
+    sentence that would CONTAIN the answer, to use as an extra retrieval query. This
+    matches the form of source documents better than the generic question, surfacing
+    specific facts (numbers, durations, definitions) the question-query misses."""
+    if model is None: model = config.llm_rewrite_model
+    client = get_openai_client()
+    if q_type == "TF":
+        sys_p = (
+            "You are a retrieval query generator for an ADRD medical/caregiving system. "
+            "Given a True/False statement, write 1-2 concise DECLARATIVE sentences as they "
+            "would plausibly appear in an authoritative source document stating the relevant "
+            "fact (include the specific number/duration/definition if the statement has one). "
+            "Do NOT judge true/false — just write the factual source-style sentence(s) to search with. "
+            "Output JSON: {\"queries\": [\"sentence1\", \"sentence2\"]}"
+        )
+        user_c = f"Statement: {question}"
+    else:
+        sys_p = (
+            "You are a retrieval query generator for an ADRD medical/caregiving system. "
+            "Given a multiple-choice question, write 1-2 concise DECLARATIVE sentences as they "
+            "would appear in an authoritative source document stating the key fact that "
+            "discriminates the correct option (include specific numbers/durations if relevant). "
+            "Output JSON: {\"queries\": [\"sentence1\", \"sentence2\"]}"
+        )
+        opts = "\n".join(f"{k}. {v}" for k, v in (options_dict or {}).items())
+        user_c = f"Question: {question}\nOptions:\n{opts}"
+    try:
+        response = _chat_with_retry(
+            client, model=model,
+            messages=[{"role": "system", "content": sys_p}, {"role": "user", "content": user_c}],
+            response_format={"type": "json_object"},
+        )
+        content = response.choices[0].message.content
+        return content if content else '{"queries": []}'
+    except Exception as e:
+        print(f"generate_draft_query API failed: {e}")
+        return '{"queries": []}'
+
+def agentic_search_queries(question, retrieved_snippets, missing_info, q_type="TF", round_idx=0, model=None):
+    """Agentic web-search step: reflect on what has ALREADY been retrieved and what is
+    still missing, then issue refined/diverse NEXT search queries targeting that gap.
+    Round 0 = obvious phrasings; later rounds must try DIFFERENT angles (synonyms,
+    broader/narrower terms, related clinical concepts, authoritative-source phrasings)
+    so we don't keep fetching the same content. Returns JSON {queries, still_missing}."""
+    if model is None: model = config.llm_rewrite_model
+    client = get_openai_client()
+    # keep the agent's view of "already have" short
+    seen = "\n".join(f"- {s[:200]}" for s in (retrieved_snippets or [])[:8]) or "(nothing retrieved yet)"
+    angle = (
+        "These are the FIRST queries — use the most direct phrasing of the missing fact."
+        if round_idx == 0 else
+        f"This is round {round_idx+1}. The previous queries did NOT surface the missing fact. "
+        "Try DISTINCTLY DIFFERENT angles: clinical synonyms, broader or narrower terms, the "
+        "specific number/definition phrased as a source sentence, guideline/authoritative wording, "
+        "or a related concept that would co-occur with the fact. Do NOT repeat earlier phrasings."
+    )
+    system_prompt = (
+        "You are a medical research agent for ADRD (Alzheimer's and related dementias) filling a "
+        "knowledge gap from the web. You are given the QUESTION, the snippets ALREADY retrieved, and "
+        "what is still MISSING. Reflect, then generate 2-3 web search queries that would find the "
+        "missing fact. Keep queries Google-friendly (natural language or 3-6 keywords), NO Boolean "
+        "operators or quotes. " + angle + "\n"
+        "Output JSON: {\"queries\": [\"q1\", \"q2\"], \"still_missing\": \"<one line>\"}"
+    )
+    kind = "True/False statement" if q_type == "TF" else "Multiple-choice question"
+    user_content = (
+        f"{kind}: {question}\n\n"
+        f"Already retrieved:\n{seen}\n\n"
+        f"Still missing: {missing_info or 'the specific discriminating fact needed to answer'}"
+    )
+    try:
+        response = _chat_with_retry(
+            client, model=model,
+            messages=[{"role": "system", "content": system_prompt},
+                      {"role": "user", "content": user_content}],
+            response_format={"type": "json_object"},
+        )
+        content = response.choices[0].message.content
+        return content if content else '{"queries": []}'
+    except Exception as e:
+        print(f"agentic_search_queries API failed: {e}")
+        return '{"queries": []}'
+
 def evaluate_tf_evidence(statement, retrieved_contexts, model=None):
     """
     TF evaluator with Chain of Thought (CoT) and clinical synonym mapping mechanisms.

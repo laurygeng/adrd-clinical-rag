@@ -169,6 +169,33 @@ def generate_answer(client, question, context="", q_type="MC"):
 # ACCURACY CHECK
 # ==========================================
 
+def verify_answer(client, question, context, q_type, prelim):
+    """Self-RAG-style ISSUP support check: re-check the preliminary answer STRICTLY
+    against the retrieved context and correct it only if the context clearly supports
+    a different answer. No outside knowledge — pure grounding verification."""
+    fmt = "'Yes' or 'No'" if q_type == "TF" else "ONE option letter (A, B, C, D, or E)"
+    verify_prompt = (
+        f"Retrieved Context:\n{context}\n\n"
+        f"Question:\n{question}\n\n"
+        f"A preliminary answer was given: {prelim}\n\n"
+        "--- VERIFY ---\n"
+        "Re-check the preliminary answer using ONLY the provided context (no outside knowledge).\n"
+        "1. Is the preliminary answer SUPPORTED by the context? If the context clearly supports a different option, correct it.\n"
+        f"2. Output ONLY the final answer: exactly {fmt}. Keep the preliminary answer unless the context clearly contradicts it."
+    )
+    try:
+        resp = _chat_with_retry(
+            client, model=MODEL_NAME,
+            messages=[{"role": "system", "content": SYSTEM_PROMPT},
+                      {"role": "user", "content": verify_prompt}],
+            temperature=0.0, max_tokens=10, presence_penalty=0.0, frequency_penalty=0.0,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        logging.error(f"verify error: {e}")
+        return prelim
+
+
 def check_accuracy(generated, ground_truth, correct_letter, q_type):
     """
     Evaluates accuracy using robust text cleaning to ensure clean format matches.
@@ -207,6 +234,8 @@ def main():
                         help="Which subset to evaluate: mc | tf | all")
     parser.add_argument("--snippets", type=int, default=GEN_CONFIG.max_context_snippets,
                         help="How many top retrieved passages to feed as context (default from GEN_CONFIG).")
+    parser.add_argument("--verify", action="store_true",
+                        help="Self-RAG ISSUP pass: re-check each answer against the context and correct if unsupported.")
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -252,6 +281,7 @@ def main():
     print(f"🚀 Starting generation for {len(df)} questions...\n")
     results = []
     missing_ctx = 0
+    n_verify_changed = 0
     checkpoint_every = 25
 
     def save_results():
@@ -274,6 +304,12 @@ def main():
 
         # 传递 row["Type"] 以便应用对应的格式要求
         generated = generate_answer(client, q_text, context, row["Type"])
+        # Self-RAG ISSUP support check (only when context exists — nothing to verify against otherwise)
+        if args.verify and context.strip():
+            verified = verify_answer(client, q_text, context, row["Type"], generated)
+            if verified and verified != generated:
+                n_verify_changed += 1
+            generated = verified or generated
         is_correct = check_accuracy(generated, row["Ground_Truth_Answer"], row["Correct_Letter"], row["Type"])
 
         results.append({
@@ -294,6 +330,8 @@ def main():
     out_df = pd.DataFrame(results)
     if retrieval_map and missing_ctx:
         print(f"⚠️  {missing_ctx} questions had NO retrieval context (answered question-only).")
+    if args.verify:
+        print(f"🔁 Verify pass changed {n_verify_changed} answers.")
 
     # Accuracy summary
     print(f"\n{'='*55}")
