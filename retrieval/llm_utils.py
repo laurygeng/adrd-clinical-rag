@@ -134,6 +134,28 @@ def generate_draft_query(question, q_type="TF", options_dict=None, model=None):
         print(f"generate_draft_query API failed: {e}")
         return '{"queries": []}'
 
+def generate_gap_query(question, missing_info="", model=None):
+    """Turn a question (and the evaluator's 'what's missing') into ONE short, targeted
+    local-search phrase naming the specific fact needed — for gap-guided re-retrieval."""
+    if model is None: model = getattr(config, "llm_gap_model", "gpt-4o-mini")
+    client = get_openai_client()
+    sysp = (
+        "Given a question (and optionally what information is missing), write ONE short search "
+        "phrase (<= 12 words) naming the SPECIFIC fact needed to answer it — a number, definition, "
+        "recommendation, or discriminating detail. Output ONLY the phrase, no punctuation."
+    )
+    user = f"Question: {question}"
+    if missing_info:
+        user += f"\nMissing: {missing_info}"
+    try:
+        r = _chat_with_retry(client, model=model, max_tokens=40, temperature=0.0,
+                             messages=[{"role": "system", "content": sysp},
+                                       {"role": "user", "content": user}])
+        return (r.choices[0].message.content or "").strip()
+    except Exception as e:
+        print(f"generate_gap_query failed: {e}")
+        return ""
+
 def agentic_search_queries(question, retrieved_snippets, missing_info, q_type="TF", round_idx=0, model=None):
     """Agentic web-search step: reflect on what has ALREADY been retrieved and what is
     still missing, then issue refined/diverse NEXT search queries targeting that gap.

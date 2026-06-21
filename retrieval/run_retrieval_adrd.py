@@ -26,6 +26,12 @@ def conf_meets(conf, threshold):
     """True if a TF confidence level is >= the verify threshold (so it can SKIP web)."""
     return _CONF_RANK.get(str(conf).lower(), 0) >= _CONF_RANK.get(str(threshold).lower(), 2)
 
+
+def run_eval(q_type, question, contexts):
+    """Sufficiency via the NLI(TF)/ItV(MC) gate. Returns (satisfied, tf_verdict, tf_confidence, eval_missing, raw)."""
+    suff = is_sufficient(q_type, question, contexts) if contexts else False
+    return (suff, None, None, "", None)
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from rag_config import config
@@ -38,7 +44,9 @@ from llm_utils import (
     generate_web_queries_from_missing_info,
     generate_draft_query,
     agentic_search_queries,
+    generate_gap_query,
 )
+from gate import is_sufficient
 from web_fallback_retriever import WebFallbackRetriever
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../"))
@@ -185,30 +193,9 @@ def main():
                 scores.append(s)
                 retrieved_chunk_ids.add(pid)
 
-        # STEP 4: Local Evaluation
-        tf_verdict, satisfied = None, False
-        tf_confidence = None
-        raw_eval, eval_missing = None, ""
-
-        if q_type == "TF" and retrieved_contexts:
-            try:
-                raw_eval = evaluate_tf_evidence(original_question, retrieved_contexts)
-                tf_eval = json.loads(clean_json_string(raw_eval))
-                tf_verdict = tf_eval.get("verdict", "insufficient")
-                tf_confidence = tf_eval.get("confidence", "low")
-                satisfied = tf_verdict in ("True", "False")
-                eval_missing = tf_eval.get("missing_information", "")
-            except Exception as e:
-                print(f"\n⚠️ TF Eval Error [{question_id}]: {e}")
-
-        elif q_type == "MC" and retrieved_contexts:
-            try:
-                raw_eval = evaluate_context(original_question, retrieved_contexts)
-                eval_res = json.loads(clean_json_string(raw_eval))
-                satisfied = eval_res.get("status") == "answerable"
-                eval_missing = eval_res.get("missing_information", "")
-            except Exception as e:
-                print(f"\n⚠️ MC Eval Error [{question_id}]: {e}")
+        # STEP 4: sufficiency GATE — NLI (TF) / ItV (MC), replacing the GPT-4o evaluator
+        tf_verdict, tf_confidence, eval_missing, raw_eval = None, None, "", None
+        satisfied = is_sufficient(q_type, original_question, retrieved_contexts) if retrieved_contexts else False
 
         # STEP 4.5: Web Fallback (Sentence-Level CRAG Filter)
         web_used = False
@@ -219,13 +206,37 @@ def main():
         web_rounds = getattr(config, "web_max_rounds", 2)
         verify_below = getattr(config, "tf_web_verify_below", "high")
 
-        # TF gate: a reached-but-not-high-confidence verdict should ALSO trigger web
-        # verification, not be trusted blindly (this was the #1 source of "satisfied
-        # but wrong" TF errors). MC keeps the original "unanswerable -> web" trigger.
+        # Gate is now the calibrated NLI/ItV sufficiency decision, so a single bool suffices.
         def need_web():
-            if q_type == "TF":
-                return (not satisfied) or (not conf_meets(tf_confidence, verify_below))
             return not satisfied
+
+        # STEP 4.25: GAP-GUIDED LOCAL RE-RETRIEVAL (self-contained; tried BEFORE web).
+        # The answer is often already in the local KB but was buried by the generic query;
+        # re-query the KB with the specific missing fact and re-evaluate.
+        gap_local_used = False
+        if need_web() and getattr(config, "gap_local_enabled", True):
+            try:
+                gq = generate_gap_query(original_question, eval_missing)
+                if gq:
+                    gp, _, gsrc = retriever.get_retrieved_passages(
+                        gq, top_k=args.top_k,
+                        bm25_weight=getattr(config, "bm25_weight", 0.30),
+                        vector_weight=getattr(config, "vector_weight", 0.70),
+                        pre_k=args.pre_k, window_size=args.window)
+                    if gp and hasattr(retriever, "rerank_texts"):
+                        rp, rs, rl = retriever.rerank_texts(original_question, retrieved_contexts + gp, sources + gsrc)
+                        nc, ns, nsc, seen = [], [], [], set()
+                        for p, s, lg in zip(rp, rs, rl):
+                            if len(nc) >= args.top_k: break
+                            pid = passage_id(s, p)
+                            if pid in seen: continue
+                            seen.add(pid); nc.append(p); ns.append(s); nsc.append(logit_to_prob(lg))
+                        retrieved_contexts, sources, scores = nc, ns, nsc
+                        gap_local_used = True
+                        satisfied, tf_verdict, tf_confidence, eval_missing, _ = run_eval(
+                            q_type, original_question, retrieved_contexts)
+            except Exception:
+                pass
 
         agentic = getattr(config, "agentic_web_enabled", False)
         if need_web() and web_enabled:
@@ -317,31 +328,13 @@ def main():
                 raw_eval = None
                 eval_missing = ""
 
-                if q_type == "TF" and retrieved_contexts:
-                    try:
-                        raw_eval = evaluate_tf_evidence(original_question, retrieved_contexts)
-                        tf_eval = json.loads(clean_json_string(raw_eval))
-                        tf_verdict = tf_eval.get("verdict", "insufficient")
-                        tf_confidence = tf_eval.get("confidence", "low")
-                        satisfied = tf_verdict in ("True", "False")
-                        eval_missing = tf_eval.get("missing_information", "")
-                    except Exception as e:
-                        pass
-                elif q_type == "MC" and retrieved_contexts:
-                    try:
-                        raw_eval = evaluate_context(original_question, retrieved_contexts)
-                        eval_res = json.loads(clean_json_string(raw_eval))
-                        satisfied = eval_res.get("status") == "answerable"
-                        eval_missing = eval_res.get("missing_information", "")
-                    except Exception as e:
-                        pass
+                satisfied, tf_verdict, tf_confidence, eval_missing, _ = run_eval(q_type, original_question, retrieved_contexts)
 
-                # Stop early only once the answer is solid: MC answerable, or TF decided
-                # AND high-enough confidence. A decided-but-low-confidence TF keeps verifying.
+                # Stop early once the gate says the context is sufficient.
                 if not need_web():
                     break
 
-        print(f"📄 [{question_id}] passages={len(retrieved_contexts)} satisfied={satisfied}" + (f" tf_verdict={tf_verdict}({tf_confidence})" if q_type == "TF" else "") + f" web_used={web_used}")
+        print(f"📄 [{question_id}] passages={len(retrieved_contexts)} satisfied={satisfied}" + (f" tf_verdict={tf_verdict}({tf_confidence})" if q_type == "TF" else "") + f" gap_local={gap_local_used} web_used={web_used}")
 
         results.append({
             "Question_ID": question_id, "Type": q_type,
@@ -350,6 +343,7 @@ def main():
             "Retrieved_Passages": json.dumps(retrieved_contexts, ensure_ascii=False),
             "Retrieved_Sources": json.dumps(sources, ensure_ascii=False),
             "Satisfied": satisfied, "TF_Verdict": tf_verdict, "TF_Confidence": tf_confidence,
+            "Gap_Local_Used": gap_local_used,
             "Eval_Missing_Information": eval_missing, "Web_Used": web_used,
             "Web_Queries": json.dumps(web_queries_used, ensure_ascii=False),
             "Web_Sources": json.dumps(list(dict.fromkeys(web_sources_used))[:30], ensure_ascii=False),
