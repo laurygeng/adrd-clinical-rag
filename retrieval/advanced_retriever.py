@@ -32,13 +32,21 @@ try:
 except Exception:
     HuggingFaceBgeEmbeddings = None
 
-# BM25 & Ensemble compatibility
+# BM25 & Ensemble compatibility. Import each SEPARATELY: previously both were in one try
+# block, so when EnsembleRetriever's path changed (langchain 1.x moved it to
+# langchain_classic), the single failure nulled BM25Retriever too — silently disabling the
+# entire hybrid and leaving retrieval VECTOR-ONLY despite bm25_weight in config.
 try:
     from langchain_community.retrievers import BM25Retriever
-    from langchain.retrievers import EnsembleRetriever
 except ImportError:
     BM25Retriever = None
-    EnsembleRetriever = None
+try:                                              # langchain >=1.0
+    from langchain_classic.retrievers import EnsembleRetriever
+except ImportError:
+    try:                                          # older layouts
+        from langchain.retrievers import EnsembleRetriever
+    except ImportError:
+        EnsembleRetriever = None
 
 class AdvancedRetriever:
     def score_text(self, query: str, text: str) -> float:
@@ -195,6 +203,18 @@ class AdvancedRetriever:
         raw_texts = [d.page_content for d in docs]
         raw_sources = [d.metadata.get('source_file') for d in docs]
         raw_ids = [d.metadata.get('child_id') for d in docs]
+
+        # Clean the candidate pool BEFORE reranking: drop academic-artifact noise (reference
+        # lists, author/affiliation blocks, table/figure dumps, page markers) so the
+        # cross-encoder spends its slots on real content instead of medium-score junk.
+        # Non-destructive (vector DB untouched); reversible via config.kb_noise_filter.
+        if getattr(config, "kb_noise_filter", True):
+            from kb_noise import is_noise
+            keep = [i for i, t in enumerate(raw_texts) if not is_noise(t)]
+            if keep and len(keep) < len(raw_texts):   # never empty the pool
+                raw_texts   = [raw_texts[i]   for i in keep]
+                raw_sources = [raw_sources[i] for i in keep]
+                raw_ids     = [raw_ids[i]     for i in keep]
 
         sorted_texts, sorted_s, sorted_ids, sorted_scores = self._rerank_passages(question, raw_texts, raw_sources, raw_ids)
 

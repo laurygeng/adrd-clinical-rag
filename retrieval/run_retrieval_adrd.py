@@ -103,6 +103,8 @@ def main():
     parser.add_argument("--window", type=int, default=getattr(config, "retrieval_window_size", 800), help="Context window expansion")
     parser.add_argument("--subset", choices=["mc", "tf", "all"], default=getattr(config, "default_subset", "all"), help="Subset to retrieve")
     parser.add_argument("--ids", type=str, default=None, help="Comma-separated Question_IDs to retrieve (subset for fast validation). Overrides --subset filtering to these IDs.")
+    parser.add_argument("--force_web", action="store_true", help="EXPERIMENT: fire web fallback regardless of the gate (bypass 'satisfied'); seeds the missing-info multi-query generator with the statement itself. For measuring the web-route ceiling on gate-blocked questions.")
+    parser.add_argument("--no_web", action="store_true", help="EXPERIMENT: disable the web fallback entirely. Combined with --force_web, isolates gap-local (local re-retrieval) as the only completion step.")
     args = parser.parse_args()
 
     print("🔧 Initializing AdvancedRetriever (Local)...")
@@ -202,13 +204,18 @@ def main():
         web_queries_used = []
         web_sources_used = []
 
-        web_enabled = getattr(config, "web_enabled", False)
+        web_enabled = getattr(config, "web_enabled", False) and not args.no_web
         web_rounds = getattr(config, "web_max_rounds", 2)
         verify_below = getattr(config, "tf_web_verify_below", "high")
 
         # Gate is now the calibrated NLI/ItV sufficiency decision, so a single bool suffices.
+        # --force_web overrides the gate (experiment: measure the web-route ceiling on
+        # questions the gate wrongly marked satisfied). Seed the multi-query generator with
+        # the statement itself so it derives 2-3 targeted sub-queries even when no gap was flagged.
+        if args.force_web and not eval_missing:
+            eval_missing = original_question
         def need_web():
-            return not satisfied
+            return (not satisfied) or args.force_web
 
         # STEP 4.25: GAP-GUIDED LOCAL RE-RETRIEVAL (self-contained; tried BEFORE web).
         # The answer is often already in the local KB but was buried by the generic query;

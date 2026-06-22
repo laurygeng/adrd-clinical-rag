@@ -85,8 +85,8 @@ class RAGConfig:
 
     # Sufficiency gate: unified Identify-then-Verify (ItV) for both TF and MC.
     # (NLI over-triggers on inferential TF: 43 flags vs ItV 24; ItV AUC 0.694 > NLI 0.675.)
-    tf_gate = "nli"            # high-recall NLI for TF; non-destructive completion makes its
-                               # false triggers harmless, so recall (catch all gaps) > precision.
+    tf_gate = "itv"            # best-AUC gate: ItV for TF (0.694) AND MC (0.731), beating NLI (0.675).
+                               # Clean-baseline run with the highest-AUC evaluator on both types.
     nli_model = "cross-encoder/nli-deberta-v3-base"
     nli_suff_threshold = 0.5
     itv_n = 5                  # ItV self-consistency runs
@@ -100,6 +100,10 @@ class RAGConfig:
     # re-query the LOCAL KB with the specific missing fact BEFORE resorting to web. The
     # answer-bearing passage is often already in the KB but was buried by the generic query.
     gap_local_enabled = True
+
+    # Candidate-pool noise filter: drop academic-artifact chunks (references, author blocks,
+    # table/figure dumps, page markers) BEFORE reranking so the cross-encoder sees real content.
+    kb_noise_filter = True
     
     
     # ==========================================
