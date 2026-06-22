@@ -39,24 +39,23 @@ def tf_sufficient(passages, statement):
     answerability = float(max(pr[:, ENT].max(), pr[:, CON].max()))  # decisively entailed OR contradicted
     return answerability >= getattr(config, "nli_suff_threshold", 0.5), answerability
 
-# ---------------- MC: Identify-then-Verify ----------------
+# ---------------- Identify-then-Verify (ItV) — TF & MC ----------------
 def _is_none(s):
     s = (s or "").strip().upper()
     return s.startswith("NONE") or s == ""
 
-def mc_sufficient(question_block, context, n=None):
+def _itv(prompt_obj, context, n=None):
+    """Generic ItV: N identify runs -> semantic consensus -> attribution verify.
+    prompt_obj = (identify_system, identify_user_prefix). Returns (sufficient, none_frac)."""
     n = n or getattr(config, "itv_n", 5)
     client = get_openai_client()
     model = getattr(config, "llm_gap_model", "gpt-4o-mini")
-    sysp = ("You judge whether a CONTEXT is sufficient to answer a multiple-choice question. "
-            "Name the SINGLE most important piece of information still MISSING from the context needed "
-            "to confidently determine the correct option. If the context already contains everything "
-            "needed, answer exactly 'NONE'. Answer with one short phrase only.")
+    sysp, user_prefix = prompt_obj
     gaps = []
     for _ in range(n):
         r = _chat_with_retry(client, model=model, temperature=0.7, max_tokens=40,
             messages=[{"role": "system", "content": sysp},
-                      {"role": "user", "content": f"Context:\n{context}\n\nQuestion:\n{question_block}"}])
+                      {"role": "user", "content": f"Context:\n{context}\n\n{user_prefix}"}])
         gaps.append((r.choices[0].message.content or "").strip())
     none_frac = float(np.mean([_is_none(g) for g in gaps]))
     if none_frac >= 0.6:
@@ -72,14 +71,31 @@ def mc_sufficient(question_block, context, n=None):
     present = "PRESENT" in (v.choices[0].message.content or "").upper()
     return present, none_frac   # present => the claimed gap was hallucinated => sufficient
 
+def mc_sufficient(question_block, context, n=None):
+    sysp = ("You judge whether a CONTEXT is sufficient to answer a multiple-choice question. "
+            "Name the SINGLE most important piece of information still MISSING from the context needed "
+            "to confidently determine the correct option. If the context already contains everything "
+            "needed, answer exactly 'NONE'. Answer with one short phrase only.")
+    return _itv((sysp, f"Question:\n{question_block}"), context, n)
+
+def tf_itv_sufficient(statement, context, n=None):
+    sysp = ("You judge whether a CONTEXT is sufficient to determine if a True/False statement is correct. "
+            "Name the SINGLE most important piece of information still MISSING from the context needed to "
+            "confidently verify OR refute the statement. If the context already has everything needed, answer "
+            "exactly 'NONE'. One short phrase only.")
+    return _itv((sysp, f"Statement: {statement}"), context, n)
+
 # ---------------- dispatch ----------------
 def is_sufficient(q_type, question, passages):
     """question already includes the options block for MC (as built in run_retrieval)."""
     try:
         if not passages:
             return False
+        ctx = "\n\n".join(passages[:8])
         if q_type == "TF":
-            return tf_sufficient(passages, question)[0]
-        return mc_sufficient(question, "\n\n".join(passages[:8]))[0]
+            if getattr(config, "tf_gate", "itv") == "nli":
+                return tf_sufficient(passages, question)[0]
+            return tf_itv_sufficient(question, ctx)[0]
+        return mc_sufficient(question, ctx)[0]
     except Exception:
         return False

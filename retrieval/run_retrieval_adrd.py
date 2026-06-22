@@ -224,6 +224,9 @@ def main():
                         vector_weight=getattr(config, "vector_weight", 0.70),
                         pre_k=args.pre_k, window_size=args.window)
                     if gp and hasattr(retriever, "rerank_texts"):
+                        # Merge original + gap-retrieved and re-rank by relevance to the question
+                        # (relevance-optimal; a non-destructive "protect top-N" ordering was tested
+                        # and performed worse — it wasted slots on low-relevance original passages).
                         rp, rs, rl = retriever.rerank_texts(original_question, retrieved_contexts + gp, sources + gsrc)
                         nc, ns, nsc, seen = [], [], [], set()
                         for p, s, lg in zip(rp, rs, rl):

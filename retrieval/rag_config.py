@@ -83,10 +83,18 @@ class RAGConfig:
     llm_rewrite_model = "gpt-4o"
     llm_gap_model = "gpt-4o-mini"   # cheap model to turn "what's missing" into a targeted query
 
-    # Sufficiency gate: TF -> local NLI answerability; MC -> Identify-then-Verify (ItV).
+    # Sufficiency gate: unified Identify-then-Verify (ItV) for both TF and MC.
+    # (NLI over-triggers on inferential TF: 43 flags vs ItV 24; ItV AUC 0.694 > NLI 0.675.)
+    tf_gate = "nli"            # high-recall NLI for TF; non-destructive completion makes its
+                               # false triggers harmless, so recall (catch all gaps) > precision.
     nli_model = "cross-encoder/nli-deberta-v3-base"
-    nli_suff_threshold = 0.5   # TF sufficient if max entail/contradict prob >= this
-    itv_n = 5                  # ItV self-consistency runs for MC
+    nli_suff_threshold = 0.5
+    itv_n = 5                  # ItV self-consistency runs
+
+    # Non-destructive completion: when gap-local fires, PROTECT the original top-N passages
+    # (place them first) so a wrongly-triggered correct answer is never displaced; gap
+    # passages take the remaining slots.
+    gap_orig_floor = 6
 
     # Gap-guided LOCAL re-retrieval: when the evaluator says a question is under-answered,
     # re-query the LOCAL KB with the specific missing fact BEFORE resorting to web. The
