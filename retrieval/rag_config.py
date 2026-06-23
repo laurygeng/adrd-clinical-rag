@@ -110,6 +110,7 @@ class RAGConfig:
     # 5. Web fallback retrieval (FREE, research-only)
     # ==========================================
     web_enabled = True
+    web_tf_enabled = False   # web fallback NET-NEGATIVE on TF (flips binary judgments); MC only. gap-local still runs for TF.
     web_max_rounds = 2          # (agentic multi-round supports up to N; 3 broadening gave no gain on DDG)
     web_per_query_k = 5         # (8 + open domains broadening gave no gain on DDG — reverted)
     agentic_web_enabled = False # reflective gap-targeted queries; off until a stronger search backend

@@ -304,6 +304,38 @@ class WebFallbackRetriever:
             
         return text_clean
 
+    def tavily_search(self, query: str, max_results: int = 6) -> List[Tuple[str, str]]:
+        """Tavily search backend — cleaner extracted content + better ranking than scraping
+        DuckDuckGo pages (DDG was the coverage bottleneck; verified Tavily surfaces confirming
+        facts DDG missed). Active only when TAVILY_API_KEY is set. Returns [(url, content), ...]
+        with the Tavily synthesized 'answer' added as a synthetic source. NO allowlist filter:
+        Tavily's ranking is reliable and the downstream cross-encoder rerank handles relevance
+        (the curated allowlist would wrongly drop good non-medical caregiving sources)."""
+        key = os.environ.get("TAVILY_API_KEY")
+        if not key:
+            return []
+        ck = f"tavily_v1::{max_results}::{query}"
+        cached = self._cache_get(ck)
+        if cached is not None:
+            return [(u, c) for u, c in cached.get("results", [])]
+        try:
+            resp = requests.post("https://api.tavily.com/search", json={
+                "api_key": key, "query": query, "search_depth": "advanced",
+                "max_results": max_results, "include_answer": True,
+            }, timeout=self.timeout_sec).json()
+        except Exception:
+            return []
+        out = []
+        ans = (resp.get("answer") or "").strip()
+        if ans:
+            out.append((f"https://tavily.answer/{hashlib.md5(query.encode()).hexdigest()[:8]}", ans))
+        for r in resp.get("results", []):
+            c = (r.get("content") or "").strip()
+            if c:
+                out.append((r.get("url", "https://tavily.result"), c))
+        self._cache_set(ck, {"results": out})
+        return out
+
     def retrieve(self, queries: List[str], per_query_k: int = 5, max_page_chars: int = 25000,
                  chunk_chars: int = 2000, chunk_overlap: int = 200,
                  max_sentences_per_source: int = 12) -> Tuple[List[str], List[str]]:
@@ -336,22 +368,35 @@ class WebFallbackRetriever:
             except Exception:
                 pass
 
-            # 2) DuckDuckGo
-            try:
-                for u in self.ddg_search_urls(q, max_results=per_query_k):
-                    if u in seen_src: continue
-                    if not self._is_allowed(u): continue
+            # 2) Web: Tavily when a key is set (cleaner content, no extra fetch/allowlist),
+            #    otherwise fall back to DuckDuckGo URL search + page scrape + allowlist.
+            if os.environ.get("TAVILY_API_KEY"):
+                try:
+                    for src, txt in self.tavily_search(q, max_results=per_query_k):
+                        if src in seen_src: continue
+                        seen_src.add(src)
+                        for s_chunk in _chunk_text_by_sentences(txt, max_chars=max_page_chars)[:max_sentences_per_source]:
+                            if _dup(s_chunk): continue
+                            passages.append(s_chunk)
+                            sources.append(src)
+                except Exception:
+                    pass
+            else:
+                try:
+                    for u in self.ddg_search_urls(q, max_results=per_query_k):
+                        if u in seen_src: continue
+                        if not self._is_allowed(u): continue
 
-                    txt = self.fetch_page_text(u, max_chars=max_page_chars)
-                    if not txt: continue
+                        txt = self.fetch_page_text(u, max_chars=max_page_chars)
+                        if not txt: continue
 
-                    seen_src.add(u)
-                    for s_chunk in _chunk_text_by_sentences(txt, max_chars=max_page_chars)[:max_sentences_per_source]:
-                        if _dup(s_chunk): continue
-                        passages.append(s_chunk)
-                        sources.append(u)
-            except Exception:
-                pass
+                        seen_src.add(u)
+                        for s_chunk in _chunk_text_by_sentences(txt, max_chars=max_page_chars)[:max_sentences_per_source]:
+                            if _dup(s_chunk): continue
+                            passages.append(s_chunk)
+                            sources.append(u)
+                except Exception:
+                    pass
 
             time.sleep(self.sleep_sec)
 

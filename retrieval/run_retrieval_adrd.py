@@ -248,8 +248,14 @@ def main():
             except Exception:
                 pass
 
+        # Web fallback is NET-NEGATIVE on TF: dumping external sentences into a binary
+        # true/false judgment flips correct answers more often than it fixes them (web on TF:
+        # 0 fixed / 2 broke in testing), while it helps MC's concrete-fact lookups (MC_016).
+        # So suppress WEB for TF (gap-local local re-retrieval above still runs — it's free and
+        # noise-free); keep web for MC and (optionally) re-enable for TF via web_tf_enabled.
+        web_ok_for_type = (q_type != "TF") or getattr(config, "web_tf_enabled", False)
         agentic = getattr(config, "agentic_web_enabled", False)
-        if need_web() and web_enabled:
+        if need_web() and web_enabled and web_ok_for_type:
             for _round in range(web_rounds):
                 if agentic:
                     # Agentic: reflect on what's already retrieved + what's missing, then
