@@ -17,8 +17,8 @@ def _cli():
     global _c
     if _c is None: _c=OpenAI()
     return _c
-def _ask(sysp,user,mx=90):
-    r=_cli().chat.completions.create(model="gpt-4",temperature=0,max_tokens=mx,
+def _ask(sysp,user,mx=90,temp=0):
+    r=_cli().chat.completions.create(model="gpt-4",temperature=temp,max_tokens=mx,
         messages=[{"role":"system","content":sysp},{"role":"user","content":user}])
     return (r.choices[0].message.content or "").strip()
 
@@ -48,16 +48,25 @@ def modal_judge(statement, evidence):
     t=_ask(s,f"STATEMENT: {statement}\nEVIDENCE: {evidence[:600]}\nAnswer:",4)
     return ("DOWNGRADE" if "DOWNGRA" in t.upper() else "MATCH"), t
 
-def fact_judge(statement, evidence):
-    s=("You are the FACT judge. Decide if the EVIDENCE supports the statement, based on the OVERALL WEIGHT / "
-       "GENERAL PRINCIPLE the literature establishes. A single nuanced or null-result study does NOT override a "
-       "clearly-stated general principle (e.g. a title 'Less pharmacotherapy is more in delirium' establishes the "
-       "principle even if one specific RCT showed no change). Academic abstracts that IMPLY the answer count. "
-       "If the evidence does not address the specific claim at all, answer NO_INFO. "
-       "Reason in one sentence, then end EXACTLY with 'VERDICT: TRUE' or 'VERDICT: FALSE' or 'VERDICT: NO_INFO'.")
-    t=_ask(s,f"EVIDENCE: {evidence[:1400]}\n\nSTATEMENT: {statement}\n\nReason:",150)
+_FACT_SYS=("You are the FACT judge. Decide if the EVIDENCE supports the statement, based on the OVERALL WEIGHT / "
+    "GENERAL PRINCIPLE the literature establishes. A single nuanced or null-result study does NOT override a "
+    "clearly-stated general principle (e.g. a title 'Less pharmacotherapy is more in delirium' establishes the "
+    "principle even if one specific RCT showed no change). Academic abstracts that IMPLY the answer count. "
+    "MEDICAL ONTOLOGY RULE: strictly distinguish Syndrome vs Disease vs Disorder, and broad class vs specific "
+    "subtype. If the statement and the evidence do not correspond at the SAME ontological level, answer NO_INFO. "
+    "If the evidence does not address the specific claim at all, answer NO_INFO. "
+    "Reason in one sentence, then end EXACTLY with 'VERDICT: TRUE' or 'VERDICT: FALSE' or 'VERDICT: NO_INFO'.")
+
+def _fact_once(statement, evidence, temp):
+    t=_ask(_FACT_SYS,f"EVIDENCE: {evidence[:1400]}\n\nSTATEMENT: {statement}\n\nReason:",150,temp)
     m=re.search(r'VERDICT:\s*(TRUE|FALSE|NO_INFO)',t.upper())
-    return (m.group(1) if m else "NO_INFO"), t
+    return m.group(1) if m else "NO_INFO"
+
+def fact_judge(statement, evidence, n=3):
+    """3-vote self-consistency majority (Fact is the high-variance judge; Entity/Modal stay single-call)."""
+    from collections import Counter
+    votes=[_fact_once(statement, evidence, 0.4) for _ in range(n)]
+    return Counter(votes).most_common(1)[0][0], votes
 
 def court(statement, evidence):
     """Returns (decision, flags). decision in {TRUE, FALSE, INSUFFICIENT}."""
