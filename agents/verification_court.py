@@ -49,11 +49,15 @@ def modal_judge(statement, evidence):
     return ("DOWNGRADE" if "DOWNGRA" in t.upper() else "MATCH"), t
 
 def fact_judge(statement, evidence):
-    s=("You are the FACT judge. Based ONLY on the evidence, does it specifically establish the statement as "
-       "TRUE or FALSE, or does it not contain the specific fact? Answer EXACTLY 'TRUE', 'FALSE', or 'NO_INFO'.")
-    t=_ask(s,f"EVIDENCE: {evidence[:600]}\n\nSTATEMENT: {statement}\n\nAnswer:",8)
-    u=t.upper()
-    return ("TRUE" if u.startswith("TRUE") else "FALSE" if u.startswith("FALSE") else "NO_INFO"), t
+    s=("You are the FACT judge. Decide if the EVIDENCE supports the statement, based on the OVERALL WEIGHT / "
+       "GENERAL PRINCIPLE the literature establishes. A single nuanced or null-result study does NOT override a "
+       "clearly-stated general principle (e.g. a title 'Less pharmacotherapy is more in delirium' establishes the "
+       "principle even if one specific RCT showed no change). Academic abstracts that IMPLY the answer count. "
+       "If the evidence does not address the specific claim at all, answer NO_INFO. "
+       "Reason in one sentence, then end EXACTLY with 'VERDICT: TRUE' or 'VERDICT: FALSE' or 'VERDICT: NO_INFO'.")
+    t=_ask(s,f"EVIDENCE: {evidence[:1400]}\n\nSTATEMENT: {statement}\n\nReason:",150)
+    m=re.search(r'VERDICT:\s*(TRUE|FALSE|NO_INFO)',t.upper())
+    return (m.group(1) if m else "NO_INFO"), t
 
 def court(statement, evidence):
     """Returns (decision, flags). decision in {TRUE, FALSE, INSUFFICIENT}."""

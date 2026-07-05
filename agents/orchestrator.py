@@ -38,19 +38,20 @@ def run_tf(bb: Blackboard, local_passages, retriever, client, generate_answer,
     bb.retrieved_evidence["web_pro"] = pro
     bb.retrieved_evidence["web_con"] = con
     bb.queries += [pq, cq]
-    evidence = " ".join(pro[:3] + con[:3])
-    if not evidence.strip():
+    pro_ev = " ".join(pro[:4]); con_ev = " ".join(con[:4])
+    if not (pro_ev.strip() or con_ev.strip()):
         bb.final_decision = bb.baseline_answer
         return bb.final_decision
 
     if not enable_court:
-        # ablation: trust the evidence with a plain verdict (no heterogeneous defenses)
-        v, _ = court.fact_judge(bb.question, evidence)
+        # ablation: trust the (support) evidence with a plain verdict (no heterogeneous defenses)
+        v, _ = court.fact_judge(bb.question, pro_ev)
         bb.final_decision = {"TRUE": "Yes", "FALSE": "No"}.get(v, bb.baseline_answer)
         return bb.final_decision
 
-    # Heterogeneous Court with veto Arbiter
-    decision, flags = court.court(bb.question, evidence)
+    # Heterogeneous Court: entity/modal/fact judge the SUPPORT evidence; refutation evidence
+    # can only VETO (a concept-swap in pro is caught by entity/modal, not by con).
+    decision, flags = court.court(bb.question, pro_ev)
     bb.judge_flags = {"entity_match": flags["entity"] == "ALIGNED",
                       "modal_match": flags["modal"] == "MATCH", "fact": flags["fact"]}
     bb.log(f"court={decision} flags={flags}")
