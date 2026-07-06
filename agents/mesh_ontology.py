@@ -5,10 +5,10 @@ Replaces the LLM 'Entity Judge' heuristic with a reproducible check on the MeSH 
 hierarchy. A MeSH tree number (e.g. Alzheimer Disease = C10.228.140.380.100) encodes an
 is-a path; a strict tree-number prefix is a strict is-a (ancestor) relation.
 
-ontology_gate(claim_term, evidence_term) -> LEAK when the evidence concept is STRICTLY
-BROADER than the claim concept (a super-class property can't transfer to a sub-type), or
-when the two concepts are incomparable (siblings / unrelated branches). OK only when the
-evidence is the same concept or MORE specific than the claim.
+ontology_gate(claim_term, evidence_term) -> LEAK (high precision) only when the evidence
+concept is a STRICT hypernym (super-class) of the claim concept: leak(c_e,c_q)=1[c_q < c_e]
+(a super-class property can't transfer to a sub-type). Same/more-specific -> OK; incomparable
+or unmapped -> deferred to the other judges (too often an extraction artifact to block).
 """
 import re, requests
 UA = {"User-Agent": "adrd-rag/1.0"}
