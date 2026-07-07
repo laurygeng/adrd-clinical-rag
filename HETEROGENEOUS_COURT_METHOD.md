@@ -173,13 +173,23 @@ real ADRD caregiving benchmark. It is a *minor but reproducible* mechanism, not 
 |---|---|---|
 | naive supplementation | −4 to −5 | churn dominates |
 | Court, no defenses | −4 | 4 breaks: {TF_063, TF_075, TF_099, TF_113} |
-| Court + ontology rule + 3-vote | **−2** | breaks: {TF_099, TF_113} |
+| Court + ontology rule + 3-vote | −2 | breaks: {TF_099, TF_113} |
+| Court + **deterministic MeSH ontology gate** | **−1** | only break: {TF_113} |
 
 Component effects: the **medical-ontology rule** fixed TF_063 (syndrome vs. disease vs. disorder);
-**3-vote self-consistency** fixed TF_075 (variance-driven flip). Of the residual −2: **TF_113** is
-a case where the system is *more correct than the gold* — it flagged "90% of communication is
-nonverbal" as a debunked urban legend, retrieving the exact refuting source — and **TF_099** is a
-borderline variance case. The method-attributable, defensible regression is thus $\approx 0$–1.
+**3-vote self-consistency** fixed TF_075 (variance-driven flip). The best configuration leaves a
+single break, **TF_113**, where the system is *more correct than the gold* — it flagged "90% of
+communication is nonverbal" as a debunked urban legend, retrieving the exact refuting source. The
+**method-attributable regression is therefore $\approx 0$** (baseline drifts 109–110 across runs
+under temperature-0 generation, so the −1/−2 difference is within run variance).
+
+**On the deterministic MeSH gate specifically.** In isolation it is validated (Table (a), 5/5) and
+integrated as a high-precision veto. On this benchmark, however, ontology-boundary leakage is a
+**rare** failure mode — essentially TF_046 alone, which the modal/factual judges already keep
+correct — so the gate seldom fires and its *aggregate* effect here is marginal. Its contribution is
+qualitative: it replaces an LLM heuristic with a **deterministic, reproducible, citable** mechanism
+for the cases where the failure mode does occur, and would carry more weight on corpora richer in
+sub-type/super-class confusions.
 
 ---
 

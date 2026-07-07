@@ -68,12 +68,26 @@ def fact_judge(statement, evidence, n=3):
     votes=[_fact_once(statement, evidence, 0.4) for _ in range(n)]
     return Counter(votes).most_common(1)[0][0], votes
 
-def court(statement, evidence):
+def _entity_check(statement, evidence, use_mesh=True):
+    """Entity/ontology verdict. With use_mesh, the deterministic MeSH gate decides; only when a
+    concept is unmapped (DEFER) do we fall back to the single-call LLM entity judge."""
+    if use_mesh:
+        try:
+            from mesh_ontology import entity_gate
+            v, det = entity_gate(_cli(), statement, evidence)
+            if v in ("MISMATCH", "ALIGNED"):
+                return v, {"source": "mesh", **det}
+        except Exception:
+            pass
+    e, er = entity_judge(statement, evidence)          # LLM fallback (DEFER / mesh unavailable)
+    return e, {"source": "llm", "text": er}
+
+def court(statement, evidence, use_mesh=True):
     """Returns (decision, flags). decision in {TRUE, FALSE, INSUFFICIENT}."""
-    e,er=entity_judge(statement,evidence)
+    e,edet=_entity_check(statement,evidence,use_mesh)
     m,mr=modal_judge(statement,evidence)
     f,fr=fact_judge(statement,evidence)
-    flags={"entity":e,"modal":m,"fact":f}
+    flags={"entity":e,"modal":m,"fact":f,"entity_src":edet.get("source")}
     # Arbiter — VETO: any red flag overrides the fact judge
     if e=="MISMATCH" or m=="DOWNGRADE" or f=="NO_INFO":
         return "INSUFFICIENT", flags
