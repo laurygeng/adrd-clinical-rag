@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import sys
 import json
 import uuid
 import hashlib
@@ -10,13 +11,18 @@ from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, PROJECT_ROOT)
+# =================================================================
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-from load_data import SimpleBrainCheckLoader
+from data_pipeline.load_data import SimpleBrainCheckLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
 from langchain_core.documents import Document
 import chromadb
-from rag_config import config
+from core.rag_config import config
 
 @dataclass
 class ProcessedNode:

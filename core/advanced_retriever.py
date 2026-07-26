@@ -13,7 +13,8 @@ except LookupError:
     nltk.download('punkt', quiet=True)
 from typing import List, Tuple, Optional
 
-from rag_config import config
+# from rag_config import config
+from core.rag_config import config
 
 # Core dependency check
 try:
@@ -209,7 +210,7 @@ class AdvancedRetriever:
         # cross-encoder spends its slots on real content instead of medium-score junk.
         # Non-destructive (vector DB untouched); reversible via config.kb_noise_filter.
         if getattr(config, "kb_noise_filter", True):
-            from kb_noise import is_noise
+            from core.kb_noise import is_noise
             keep = [i for i, t in enumerate(raw_texts) if not is_noise(t)]
             if keep and len(keep) < len(raw_texts):   # never empty the pool
                 raw_texts   = [raw_texts[i]   for i in keep]
