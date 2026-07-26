@@ -150,17 +150,25 @@ def generate_answer(model, question, context="", q_type="MC"):
 # ==========================================
 
 def check_accuracy(generated, ground_truth, correct_letter, q_type):
-    first_token = generated.strip().split()[0].rstrip(".,!?:").upper() if generated.strip() else ""
+    if not generated:
+        return False
+        
+    text = generated.strip().upper()
+    first_token = text.split()[0].rstrip(".,!?:") if text else ""
+    
     if q_type == "TF":
-        gt = ground_truth.strip().upper()
-        # Accept both Yes/No and True/False outputs from the model
-        if gt == "YES" and first_token in ("YES", "TRUE"):
-            return True
-        if gt == "NO" and first_token in ("NO", "FALSE"):
-            return True
-        return first_token == gt
+        gt = str(ground_truth).strip().upper()
+        yes_variants = ("YES", "TRUE", "T")
+        no_variants = ("NO", "FALSE", "F")
+        
+        if gt in ("YES", "TRUE"):
+            return first_token in yes_variants
+        else:
+            return first_token in no_variants
+        
     elif q_type == "MC":
-        return first_token == correct_letter.strip().upper()
+        return first_token == str(correct_letter).strip().upper()
+        
     return False
 
 
@@ -241,7 +249,7 @@ def main():
                 context = build_context_from_passages(
                     entry.get("passages", []),
                     GEN_CONFIG.max_context_snippets,
-                    scores=entry.get("scores", []),
+                    # scores=entry.get("scores", []),
                 )
                 # If TF and a TF_Verdict exists from the retrieval step, inject it as a high-priority hint
                 if q_type == "TF" and entry.get("tf_verdict"):

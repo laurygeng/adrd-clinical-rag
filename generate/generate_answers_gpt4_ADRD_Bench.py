@@ -17,6 +17,7 @@ import json
 import time
 import logging
 import argparse
+import re
 import pandas as pd
 from datetime import datetime
 from openai import OpenAI
@@ -61,8 +62,7 @@ def load_adrd_bench(subset="all"):
                 ground_truth_text = options.get(ans_letter, ans_letter)
                 options_str = "\n".join([f"  {k}. {v}" for k, v in options.items()])
                 formatted_q = (
-                    f"{q_text}\n\nOptions:\n{options_str}\n\n"
-                    f"Answer with ONLY the correct letter (A/B/C/D/E)."
+                    f"{q_text}\n\nOptions:\n{options_str}\n"
                 )
                 records.append({
                     "Question_ID": q_id, "Question": formatted_q,
@@ -83,7 +83,7 @@ def load_adrd_bench(subset="all"):
                 q_id = f"ADRD_TF_{item['ID']:03d}"
                 q_text = item["Question"]
                 ground_truth = item["Answer"]
-                formatted_q = f"True or False statement: {q_text}\n\nAnswer with ONLY Yes or No."
+                formatted_q = f"True or False statement: {q_text}\n"
                 records.append({
                     "Question_ID": q_id, "Question": formatted_q,
                     "Ground_Truth_Answer": ground_truth,
@@ -105,25 +105,63 @@ def load_adrd_bench(subset="all"):
 # GENERATION (OpenAI GPT-4)
 # ==========================================
 
-def generate_answer(client, question, context=""):
-    """Call GPT-4 via OpenAI API with optional RAG context."""
-    user_content = format_user_prompt(context, question)
+def _chat_with_retry(client, *, max_retries=4, base_delay=1.5, **kwargs):
+    """Call chat.completions.create with exponential backoff on transient errors.
+
+    Raises the last exception only if every attempt fails, so a single network
+    blip no longer gets scored as a wrong answer.
+    """
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as e:
+            last_err = e
+            if attempt < max_retries - 1:
+                time.sleep(base_delay * (2 ** attempt))
+    raise last_err
+
+
+def generate_answer(client, question, context="", q_type="MC"):
+    """Call GPT-4 via OpenAI API with strict RAG grounding and forced format."""
+    base_user_content = format_user_prompt(context, question)
+
+    # 严格基于检索上下文作答：不让模型自由发挥/自带知识，证据不足也不强迫硬猜。
+    strict_instruction = (
+        "\n\n--- INSTRUCTIONS ---\n"
+        "1. GROUNDING: Answer STRICTLY based on the provided context. Do NOT use outside or internal knowledge.\n"
+        "2. FORMAT: Output ONLY the final answer, with no explanation or extra text.\n"
+    )
+
+    if q_type == "TF":
+        strict_instruction += (
+            "3. DECISION RULE: answer 'Yes' if the context states OR implies the statement; "
+            "answer 'No' if the context contradicts it or contains no related information.\n"
+            "4. Your output must be EXACTLY 'Yes' or 'No'."
+        )
+    else:
+        strict_instruction += (
+            "3. Your output must be EXACTLY ONE option letter (A, B, C, D, or E) — the one best supported by the context."
+        )
+
+    user_content = base_user_content + strict_instruction
 
     try:
-        response = client.chat.completions.create(
+        response = _chat_with_retry(
+            client,
             model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user",   "content": user_content},
             ],
-            temperature=0.1,
-            max_tokens=GEN_CONFIG.openai_max_tokens,
-            presence_penalty=0.1,
-            frequency_penalty=0.1,
+            temperature=0.0, # 降为0保证格式的绝对稳定性
+            max_tokens=10,   # 极小限制，逼迫大模型只输出字母/判断词
+            presence_penalty=0.0,
+            frequency_penalty=0.0,
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        logging.error(f"API error: {e}")
+        logging.error(f"API error (after retries): {e}")
         return f"Error: {e}"
 
 
@@ -131,12 +169,56 @@ def generate_answer(client, question, context=""):
 # ACCURACY CHECK
 # ==========================================
 
+def verify_answer(client, question, context, q_type, prelim):
+    """Self-RAG-style ISSUP support check: re-check the preliminary answer STRICTLY
+    against the retrieved context and correct it only if the context clearly supports
+    a different answer. No outside knowledge — pure grounding verification."""
+    fmt = "'Yes' or 'No'" if q_type == "TF" else "ONE option letter (A, B, C, D, or E)"
+    verify_prompt = (
+        f"Retrieved Context:\n{context}\n\n"
+        f"Question:\n{question}\n\n"
+        f"A preliminary answer was given: {prelim}\n\n"
+        "--- VERIFY ---\n"
+        "Re-check the preliminary answer using ONLY the provided context (no outside knowledge).\n"
+        "1. Is the preliminary answer SUPPORTED by the context? If the context clearly supports a different option, correct it.\n"
+        f"2. Output ONLY the final answer: exactly {fmt}. Keep the preliminary answer unless the context clearly contradicts it."
+    )
+    try:
+        resp = _chat_with_retry(
+            client, model=MODEL_NAME,
+            messages=[{"role": "system", "content": SYSTEM_PROMPT},
+                      {"role": "user", "content": verify_prompt}],
+            temperature=0.0, max_tokens=10, presence_penalty=0.0, frequency_penalty=0.0,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        logging.error(f"verify error: {e}")
+        return prelim
+
+
 def check_accuracy(generated, ground_truth, correct_letter, q_type):
-    first_token = generated.strip().split()[0].rstrip(".,!?:").upper() if generated.strip() else ""
+    """
+    Evaluates accuracy using robust text cleaning to ensure clean format matches.
+    """
+    generated_clean = generated.strip().upper()
+    
+    # 清理掉模型可能带上的标点符号或多余字符
+    generated_clean = re.sub(r'[^A-Z]', '', generated_clean)
+
     if q_type == "TF":
-        return first_token == ground_truth.strip().upper()
+        gt = ground_truth.strip().upper()
+        if gt in ["YES", "TRUE"]:
+            return generated_clean in ["YES", "TRUE", "Y", "T"]
+        if gt in ["NO", "FALSE"]:
+            return generated_clean in ["NO", "FALSE", "N", "F"]
+        return generated_clean == gt
+        
     elif q_type == "MC":
-        return first_token == correct_letter.strip().upper()
+        # 如果模型输出了类似 "BTHECONTEXTDOESNOT..." 的长串，我们只抓取首字母
+        if generated_clean and generated_clean[0] in "ABCDE":
+            return generated_clean[0] == correct_letter.strip().upper()
+        return False
+        
     return False
 
 
@@ -150,6 +232,10 @@ def main():
                         help="Path to retrieval results CSV (optional).")
     parser.add_argument("--subset", choices=["mc", "tf", "all"], default="all",
                         help="Which subset to evaluate: mc | tf | all")
+    parser.add_argument("--snippets", type=int, default=GEN_CONFIG.max_context_snippets,
+                        help="How many top retrieved passages to feed as context (default from GEN_CONFIG).")
+    parser.add_argument("--verify", action="store_true",
+                        help="Self-RAG ISSUP pass: re-check each answer against the context and correct if unsupported.")
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -164,7 +250,8 @@ def main():
     if not api_key:
         print("❌ Error: Please set the OPENAI_API_KEY environment variable.")
         return
-    client = OpenAI(api_key=api_key)
+    base_url = os.environ.get("OPENAI_BASE_URL")
+    client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
 
     print(f"🤖 Model : {MODEL_NAME}")
     print(f"📂 Output: {output_csv}")
@@ -193,16 +280,36 @@ def main():
     # Generation loop
     print(f"🚀 Starting generation for {len(df)} questions...\n")
     results = []
+    missing_ctx = 0
+    n_verify_changed = 0
+    checkpoint_every = 25
 
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="GPT-4 ADRD-Bench"):
+    def save_results():
+        tmp = output_csv + ".tmp"
+        pd.DataFrame(results).to_csv(tmp, index=False, encoding="utf-8-sig")
+        os.replace(tmp, output_csv)
+
+    for idx, (_, row) in enumerate(tqdm(df.iterrows(), total=len(df), desc="GPT-4 ADRD-Bench")):
         q_text = row["Question"]
         context = ""
+        n_snippets = 0
         if retrieval_map:
             passages = retrieval_map.get(row["Question_ID"], [])
             if passages:
-                context = build_context_from_passages(passages, GEN_CONFIG.max_context_snippets)
+                context = build_context_from_passages(passages, args.snippets)
+                n_snippets = min(len(passages), args.snippets)
+            else:
+                # RAG mode but this question had no retrieval row -> silent no-context fallback
+                missing_ctx += 1
 
-        generated = generate_answer(client, q_text, context)
+        # 传递 row["Type"] 以便应用对应的格式要求
+        generated = generate_answer(client, q_text, context, row["Type"])
+        # Self-RAG ISSUP support check (only when context exists — nothing to verify against otherwise)
+        if args.verify and context.strip():
+            verified = verify_answer(client, q_text, context, row["Type"], generated)
+            if verified and verified != generated:
+                n_verify_changed += 1
+            generated = verified or generated
         is_correct = check_accuracy(generated, row["Ground_Truth_Answer"], row["Correct_Letter"], row["Type"])
 
         results.append({
@@ -210,12 +317,21 @@ def main():
             "Question": q_text, "Generated_Answer": generated,
             "Ground_Truth_Answer": row["Ground_Truth_Answer"],
             "Correct_Letter": row["Correct_Letter"], "Is_Correct": is_correct,
+            # Diagnostics for downstream failure analysis (retrieval vs generation):
+            "Has_Context": bool(context.strip()), "N_Snippets": n_snippets,
         })
+        # Incremental checkpoint so a crash mid-run does not lose progress.
+        if checkpoint_every and (idx + 1) % checkpoint_every == 0:
+            save_results()
         time.sleep(0.3)
 
     # Save
+    save_results()
     out_df = pd.DataFrame(results)
-    out_df.to_csv(output_csv, index=False, encoding="utf-8-sig")
+    if retrieval_map and missing_ctx:
+        print(f"⚠️  {missing_ctx} questions had NO retrieval context (answered question-only).")
+    if args.verify:
+        print(f"🔁 Verify pass changed {n_verify_changed} answers.")
 
     # Accuracy summary
     print(f"\n{'='*55}")

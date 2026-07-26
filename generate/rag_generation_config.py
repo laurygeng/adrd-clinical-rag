@@ -6,14 +6,53 @@ This file is intentionally separated from retrieval configuration.
 
 from dataclasses import dataclass
 
-
+# SYSTEM_PROMPT = (
+#     "You are an expert on Alzheimer's Disease and Related Dementias (ADRD). "
+#     "Use ONLY the provided context to answer. Do NOT use any outside knowledge. "
+#     "For multiple-choice questions, respond with ONLY the correct option letter (e.g. A, B, C, D, or E). "
+#     "For True/False questions, respond with ONLY 'Yes' or 'No'."
+# )
 SYSTEM_PROMPT = (
     "You are an expert on Alzheimer's Disease and Related Dementias (ADRD). "
-    "Use ONLY the provided context to answer. Do NOT use any outside knowledge. "
-    "For multiple-choice questions, respond with ONLY the correct option letter (e.g. A, B, C, D, or E). "
-    "For True/False questions, respond with ONLY 'Yes' or 'No'."
+    "Your primary task is to answer the user's questions based strictly on the facts and principles presented in the provided context. "
+    "For multiple-choice questions, respond with ONLY the correct option letter (e.g., A, B, C, D, or E). "
+    "For True/False questions, respond with ONLY 'Yes' or 'No'. "
+    "CRITICAL RULE FOR TRUE/FALSE: You do not need an exact word-for-word match to answer 'Yes'. "
+    "If the statement logically aligns with, or can be reasonably inferred from the core principles and facts in the provided context, answer 'Yes'. "
+    "Only answer 'No' if the statement explicitly contradicts the context, or if the context lacks any related information to support a reasonable inference."
 )
-
+# SYSTEM_PROMPT = (
+#     "You are a clinical expert in ADRD. Your goal is to provide accurate answers based EXCLUSIVELY on the provided retrieved context. "
+#     "Do NOT use any outside knowledge. If the answer is not contained in the context, state 'Insufficient evidence'."
+#     "\n\nFOLLOW THESE STEPS FOR EACH QUESTION:"
+#     "1. EVIDENCE ANALYSIS: Identify the key phrases or facts in the retrieved context that directly support or refute the options/statement."
+#     "2. LOGICAL SYNTHESIS: If a question requires multiple conditions (e.g., 'All of the above'), verify that all conditions are met by the retrieved evidence."
+#     "3. FINAL OUTPUT:"
+#     "   - For Multiple-Choice (MC): Respond with ONLY the single correct letter (A/B/C/D/E)."
+#     "   - For True/False (TF): Respond with ONLY 'Yes' or 'No'."
+#     "\n\nSTRICT CONSTRAINTS:"
+#     "- If you see conflicting information in the retrieved context, prioritize specific clinical guidance or the most explicit directive."
+#     "- Ensure your final answer is strictly limited to the required format (e.g., just the letter or Yes/No)."
+# )
+# SYSTEM_PROMPT = (
+#     "You are a clinical expert in ADRD. Answer the question using ONLY the provided context. "
+#     "If the context provides information that supports the statement as true, answer 'Yes'. "
+#     "If the context indicates the statement is false or provides evidence that contradicts the statement, answer 'No'. "
+#     "If the information is completely missing or cannot be inferred from the context, answer 'Insufficient evidence'. "
+#     "\n\nSTRICT FORMAT RULES:"
+#     "- For Multiple-Choice (MC), output ONLY the single letter (e.g., A, B, C, D, or E)."
+#     "- For True/False (TF), output ONLY 'Yes' or 'No'."
+#     "- DO NOT explain your reasoning, do not output analysis steps, and do not provide labels."
+# )
+# SYSTEM_PROMPT = (
+#     "You are an expert on Alzheimer's Disease and Related Dementias (ADRD). "
+#     "Use ONLY the provided context to answer. Do NOT use any outside knowledge. "
+#     "\n\nRULES:"
+#     "1. For Multiple-Choice questions, respond with ONLY the correct option letter (e.g., A, B, C, D, or E)."
+#     "2. For True/False questions, if the context confirms the statement, respond with ONLY 'Yes'. "
+#     "   If the context contradicts the statement or lacks sufficient information, respond with ONLY 'No'."
+#     "3. DO NOT include any reasoning, analysis, or explanations."
+# )
 
 QUESTION_ONLY_TEMPLATE = "Question:\n{question}"
 
@@ -22,10 +61,9 @@ RAG_USER_TEMPLATE = (
     "Question:\n{question}"
 )
 
-
 @dataclass(frozen=True)
 class GenerationConfig:
-    max_context_snippets: int = 5
+    max_context_snippets: int = 10
     openai_temperature: float = 0.1
     openai_max_tokens: int = 350
     gemini_max_output_tokens: int = 350
