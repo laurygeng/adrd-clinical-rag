@@ -1,0 +1,5 @@
+{
+  "run_dir": "/Users/minjie/Desktop/code/rag_adrd/code/logs/20260727_010430",
+  "orchestrator_model": "gpt-4o",
+  "notes": "Pipeline traces written to logs/<run_ts>/orchestrator/pipeline_traces.jsonl"
+}
