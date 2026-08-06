@@ -33,3 +33,15 @@ load_data.py（代码片段 20）
 ### Orchestrator Agent（编排调度器 —— 代码片段 4）
 作用：控制执行顺序与流程。  
 特点：不依赖复杂的框架（如 LangGraph），而是通过一个透明的 Python 控制流循环，将答案生成、网络检索和法庭校验串联起来。  
+
+
+### 0805 log更新
+rag_config.py：这是系统的全局配置文件，advanced_retriever.py 强依赖它来读取切片大小、检索数量（top_k）、使用的模型名称等核心参数。  trace_logger.py：这是追踪和日志记录工具，critic_agent.py 和 orchestrator.py 都在大量调用它来生成 .md 日志文件和 .jsonl 数据记录。  kb_noise.py：这是知识库清理组件。在 advanced_retriever.py 的重排（Rerank）阶段之前，系统会调用它过滤掉论文参考文献、作者信息等噪声文本，以保证传给模型的上下文足够纯净。  
+
+
+这两个文件是之前为了维护复杂的分支逻辑而存在的，现在已经完全被架空：
+verification_agent.py
+mesh_ontology.py
+
+orchestrator.py 中，已经将所有题型的评估交给了统一的 Identify-then-Verify (ItV) 机制。
+原本由 verification_agent.py 负责的“法庭审核（Court Auditing）”步骤已经在代码中被硬编码为跳过
