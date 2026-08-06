@@ -1,24 +1,12 @@
 #!/usr/bin/env python3
 """
-Orchestrator (TF Iter-3)
+Orchestrator (TF Iter-3) — Hardened
 
-MC/QA: unchanged completion gate:
-  (not is_sufficient) AND (critic_verify_label == "ABSENT") AND (not negative_gap)
-
-TF (Iter-3):
-- NLI labels: SUPPORTED | HARD_CONTRADICTION | SOFT_CONTRADICTION | NOT_ENOUGH_INFO
-- Gate completion by TF NLI:
-    NOT_ENOUGH_INFO or SOFT_CONTRADICTION => completion
-    SUPPORTED or HARD_CONTRADICTION => no completion
-- 2-hop completion:
-    Hop1 uses statement + sanitized consensus_gap (local + web)
-    If Hop1 post-NLI still NEI or SOFT_CONTRADICTION => Hop2 with query rewrite (local + web)
-- TF final answer is deterministic mapping from final TF NLI label (bypass Answer LLM):
-    SUPPORTED => Yes
-    HARD_CONTRADICTION => No
-    SOFT_CONTRADICTION / NOT_ENOUGH_INFO => No (fallback)
-- Inject TOP EVIDENCE (TF) ONLY when final NLI is SUPPORTED or HARD_CONTRADICTION
-- Court policy: BYPASSED for testing. Veto is never triggered.
+Key hardening:
+- TF NLI label must ALWAYS exist (never empty/NaN). If missing, emergency rerun on available context.
+- Normalize legacy/variant labels (e.g., CONTRADICTED -> HARD_CONTRADICTION).
+- Injection is audit-only and MUST NOT gate NLI.
+- TF final answer still calls LLM (business requirement) but is locked to deterministic mapping.
 """
 
 import os
@@ -31,7 +19,7 @@ from openai import OpenAI
 
 from core.advanced_retriever import AdvancedRetriever
 from core.critic_agent import evaluate_sufficiency, rerun_tf_nli
-from core.answer_agent import generate_final_answer
+from core.answer_agent import generate_final_answer, generate_tf_final_answer_locked
 from core.search_agent import research
 from core.trace_logger import write_jsonl, make_item_id, write_run_meta, get_run_dir
 
@@ -39,6 +27,32 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 _retriever_instance = None
 _oai_client = None
+
+TF_LABELS = {"SUPPORTED", "HARD_CONTRADICTION", "SOFT_CONTRADICTION", "NOT_ENOUGH_INFO"}
+
+
+def _normalize_tf_label(label: str) -> str:
+    lab = (label or "").strip().upper()
+    if lab in ("CONTRADICTED", "HARD_CONTRADICTION"):
+        return "HARD_CONTRADICTION"
+    if lab in ("SOFT_CONTRADICTION",):
+        return "SOFT_CONTRADICTION"
+    if lab in ("SUPPORTED", "NOT_ENOUGH_INFO"):
+        return lab
+    return ""
+
+
+def _ensure_tf_label(trace_log: Dict[str, Any], field: str, default: str = "NOT_ENOUGH_INFO") -> str:
+    """
+    Ensure a TF NLI label field exists and is valid.
+    Returns normalized label (guaranteed non-empty and within TF_LABELS).
+    """
+    lab = _normalize_tf_label(trace_log.get(field, ""))
+    if lab in TF_LABELS:
+        trace_log[field] = lab
+        return lab
+    trace_log[field] = default
+    return default
 
 
 def get_retriever():
@@ -101,146 +115,113 @@ def sanitize_gap_text(gap: str) -> str:
     g = str(gap).strip()
     if not g:
         return ""
-    lower = g.lower()
-    bad = [
-        "single most important piece",
-        "still missing",
-        "answer exactly",
-        "one short phrase",
-        "you judge whether",
-        "context:",
-        "question:",
-        "statement:",
-        "sufficient to decide",
-    ]
-    if any(b in lower for b in bad):
-        return ""
-    if lower in ("none", "n/a", "na", "nan"):
-        return ""
-    if len(g) > 120 or "\n" in g:
-        return ""
-    return g
+    # keep it short-ish
+    return g[:800]
 
 
 def build_tf_completion_query(statement: str, consensus_gap: str) -> str:
-    stmt = (statement or "").strip()
-    gap_s = sanitize_gap_text(consensus_gap)
-    if gap_s:
-        return f"{stmt}\n\nMissing detail to verify: {gap_s}".strip()
-    return stmt
+    gap = sanitize_gap_text(consensus_gap)
+    if gap:
+        return f"{statement.strip()}\n\nMissing info to find (hint): {gap}".strip()
+    return statement.strip()
+
+
+# def generate_web_rewrite_query(statement: str, gap_hint: str = "") -> str:
+#     s = statement.strip()
+#     gh = sanitize_gap_text(gap_hint)
+#     if gh:
+#         return f"{s}\n\nSearch query focus: {gh}".strip()
+#     return s
+def generate_web_rewrite_query(statement: str, gap_hint: str = "") -> str:
+    """
+    [方案3 优化版] 使用 LLM 深度提取和改写定向突破的 Google 搜索词。
+    将原陈述与缺失信息(Gap)结合，生成高精度搜索词，避免泛泛而谈。
+    """
+    s = statement.strip()
+    gh = sanitize_gap_text(gap_hint)
+    
+    if not gh:
+        return s
+        
+    client = get_oai_client()
+    sys_prompt = "You are an expert medical search query generator."
+    
+    # 引导 LLM 生成专门用于“验证缺失细节”的高精度检索词
+    user_prompt = (
+        f"We are trying to verify this True/False statement:\n\"{s}\"\n\n"
+        f"However, the current evidence is missing this critical information:\n\"{gh}\"\n\n"
+        "Please generate a single, highly precise Google search query (3-8 keywords) "
+        "to find this exact missing information. Focus on specific medical terms or guidelines. "
+        "Output ONLY the query text without quotes, markdown, or preamble."
+    )
+    
+    try:
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.0,
+            max_tokens=30,
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+        )
+        query = (r.choices[0].message.content or "").strip().strip('"\'')
+        return query if query else f"{s} {gh}"
+    except Exception as e:
+        logging.warning(f"Query rewrite LLM call failed: {e}")
+        # 降级回退到原有的简单拼接
+        return f"{s}\n\nSearch query focus: {gh}".strip()
+
+def _pick_span_for_injection(trace_log: Dict[str, Any], use_hop2: bool = False) -> str:
+    spans_key = "tf_support_top_spans_hop2" if use_hop2 else "tf_support_top_spans"
+    spans = trace_log.get(spans_key, []) or []
+    if spans:
+        return str(spans[0])
+    # fallback to any best span fields if present
+    return ""
 
 
 def build_tf_top_evidence_block(span: str, nli_label: str, citations: List[str]) -> str:
     span = (span or "").strip()
     if not span:
         return ""
-    cite = ""
-    if citations:
-        cite = "\n\nCITATIONS:\n- " + "\n- ".join([c.strip() for c in citations[:3] if c.strip()])
-    return (
-        "=== TOP EVIDENCE (TF) ===\n"
-        f"[NLI={nli_label}]\n"
-        f"{span}\n"
-        f"{cite}\n"
-        "=== END TOP EVIDENCE (TF) ===\n"
-    )
+    cits = [str(c).strip() for c in (citations or []) if str(c).strip()]
+    cits = cits[:5]
+    cit_block = "\n".join([f"- {c}" for c in cits]) if cits else ""
+    block = [
+        "=== TOP EVIDENCE (TF) ===",
+        f"NLI_LABEL: {nli_label}",
+        "SPAN:",
+        span,
+    ]
+    if cit_block:
+        block += ["CITATIONS:", cit_block]
+    block.append("=== END TOP EVIDENCE ===")
+    return "\n".join(block) + "\n"
 
 
-def generate_web_rewrite_query(statement: str, gap_hint: str = "") -> str:
-    """
-    TF-only query rewrite for Hop2: produce sharp web query keywords.
-    Output ONLY the query string.
-    """
-    client = get_oai_client()
-    stmt = (statement or "").strip()
-    hint = sanitize_gap_text(gap_hint)
-    user = stmt
-    if hint:
-        user = f"{stmt}\n\nMissing detail to verify: {hint}".strip()
-
-    sys_prompt = (
-        "You are an expert search query generator.\n"
-        "Convert the given True/False statement into a highly optimized Google search query.\n"
-        "Rules:\n"
-        "- Extract core medical entities and key relationship.\n"
-        "- Preserve any numbers, percentages, age ranges, time ranges.\n"
-        "- Include important synonyms.\n"
-        "- Drop filler words.\n"
-        "- Output ONLY the query string, nothing else."
-    )
-
-    try:
-        r = client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.0,
-            max_tokens=48,
-            messages=[
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": user},
-            ],
-        )
-        q = (r.choices[0].message.content or "").strip()
-        return q or stmt
-    except Exception:
-        return stmt
-
-
-def _pick_span_for_injection(trace: Dict[str, Any], use_hop2: bool = False) -> str:
-    spans = trace.get("tf_support_top_spans_hop2" if use_hop2 else "tf_support_top_spans", []) or []
-    best_i = trace.get("tf_nli_best_span_index_hop2" if use_hop2 else "tf_nli_best_span_index_post_completion")
-    if best_i is None and not use_hop2:
-        best_i = trace.get("tf_nli_best_span_index")  # pre
-    if isinstance(best_i, int) and 0 <= best_i < len(spans):
-        return spans[best_i]
-    return spans[0] if spans else ""
-
-
-def run_pipeline(question: str, q_type: str, question_id: str = None) -> Dict[str, Any]:
+def run_pipeline(question: str, q_type: str = "MC", question_id: str = "") -> Dict[str, Any]:
     retriever = get_retriever()
     client = get_oai_client()
 
-    try:
-        write_run_meta(
-            {
-                "run_dir": get_run_dir(),
-                "orchestrator_model": "gpt-4o",
-                "notes": "Pipeline traces written to logs/<run_ts>/orchestrator/pipeline_traces.jsonl",
-            }
-        )
-    except Exception:
-        pass
-
+    run_dir = get_run_dir()
     item_id = make_item_id(question_id, question)
 
     trace_log: Dict[str, Any] = {
+        "run_dir": run_dir,
         "item_id": item_id,
         "question_id": question_id,
         "q_type": q_type,
 
-        "is_sufficient": True,
+        "is_sufficient": None,
         "missing_info": "",
 
-        "completion_triggered": False,
-        "completion_reason": "",
-        "completion_skipped_reason": "",
-
-        "web_query_used": "",
-        "web_query_used_hop2": "",
-        "hop2_triggered": False,
-        "hop2_reason": "",
-
-        "court_statement_used": "",
-        "court_verdict": "BYPASSED",
-        "court_flags": {},
-        "veto_triggered": False,
-
-        # Critic audit
         "critic_decision": "",
         "critic_none_frac_strict": None,
         "critic_empty_frac": None,
         "critic_invalid_gap_frac": None,
         "critic_consensus_gap": "",
-        "critic_consensus_gap_is_negative": None,
+        "critic_consensus_gap_is_negative": False,
 
         "critic_verify_mode": "",
         "critic_verify_label": "",
@@ -251,7 +232,7 @@ def run_pipeline(question: str, q_type: str, question_id: str = None) -> Dict[st
         "critic_verify_window_sents": None,
         "critic_md_path": "",
 
-        # TF pre (from critic)
+        # TF pre
         "tf_support_top_spans": [],
         "tf_support_top_scores": [],
         "tf_nli_label": "",
@@ -261,14 +242,14 @@ def run_pipeline(question: str, q_type: str, question_id: str = None) -> Dict[st
         "tf_nli_explanation": "",
         "tf_support_injected": False,
 
-        # TF hop1 post-completion NLI
+        # TF hop1
         "tf_nli_label_post_completion": "",
         "tf_nli_confidence_post_completion": None,
         "tf_nli_best_span_index_post_completion": None,
         "tf_nli_citations_post_completion": [],
         "tf_nli_explanation_post_completion": "",
 
-        # TF hop2 fields (NEW; do not overwrite hop1)
+        # TF hop2
         "tf_nli_label_hop2": "",
         "tf_nli_confidence_hop2": None,
         "tf_nli_best_span_index_hop2": None,
@@ -277,9 +258,23 @@ def run_pipeline(question: str, q_type: str, question_id: str = None) -> Dict[st
         "tf_support_top_spans_hop2": [],
         "tf_support_top_scores_hop2": [],
 
-        # TF final decision audit
+        # triggers
+        "completion_triggered": False,
+        "completion_reason": "",
+        "completion_skipped_reason": "",
+        "hop2_triggered": False,
+        "hop2_reason": "",
+
+        # final audit
         "tf_final_nli_label_used": "",
-        "tf_final_answer_source": "",  # NLI_PRE / NLI_HOP1 / NLI_HOP2 / FALLBACK
+        "tf_final_answer_source": "",
+        "tf_answer_llm_locked": False,
+        "web_query_used": "",
+        "web_query_used_hop2": "",
+        "court_statement_used": "",
+        "court_verdict": "",
+        "court_flags": {},
+        "veto_triggered": False,
     }
 
     # STEP 1: Base Retrieval
@@ -332,17 +327,41 @@ def run_pipeline(question: str, q_type: str, question_id: str = None) -> Dict[st
         trace_log["tf_nli_confidence"] = critic_trace.get("tf_nli_confidence")
         trace_log["tf_nli_best_span_index"] = critic_trace.get("tf_nli_best_span_index")
         trace_log["tf_nli_citations"] = critic_trace.get("tf_nli_citations", []) or []
-        trace_log["tf_nli_explanation"] = critic_trace.get("tf_nli_explanation", "")
+        trace_log["tf_nli_explanation"] = critic_trace.get("tf_nli_explanation", "") or ""
 
     q_type_u = (q_type or "").strip().upper()
 
     # STEP 3-5
     if q_type_u == "TF":
-        nli_label_pre = (trace_log.get("tf_nli_label") or "").strip().upper()
+        # --- Emergency: ensure PRE NLI label exists ---
+        pre_label = _normalize_tf_label(trace_log.get("tf_nli_label", ""))
+        if pre_label not in TF_LABELS:
+            logging.warning(f"[TF_PRE_LABEL_MISSING] qid={question_id} pre_label='{trace_log.get('tf_nli_label')}'. Emergency rerun on base_context.")
+            try:
+                post = rerun_tf_nli(
+                    statement=question,
+                    context=base_context,
+                    retriever=retriever,
+                    window_sents=2,
+                    max_spans=120,
+                    top_k=5,
+                )
+                nli = (post.get("nli") or {})
+                trace_log["tf_nli_label"] = (nli.get("label") or "").strip()
+                trace_log["tf_nli_confidence"] = nli.get("confidence")
+                trace_log["tf_nli_best_span_index"] = nli.get("best_span_index")
+                trace_log["tf_nli_citations"] = nli.get("citations", []) or []
+                trace_log["tf_nli_explanation"] = nli.get("explanation", "") or ""
+                trace_log["tf_support_top_spans"] = post.get("top_spans", []) or trace_log.get("tf_support_top_spans", [])
+                trace_log["tf_support_top_scores"] = post.get("top_scores", []) or trace_log.get("tf_support_top_scores", [])
+            except Exception as e:
+                logging.error(f"[TF_PRE_LABEL_RERUN_FAILED] qid={question_id}: {e}")
 
-        # Iter-3 gate: NEI or SOFT_CONTRADICTION => completion
+        # finalize/normalize pre label
+        nli_label_pre = _ensure_tf_label(trace_log, "tf_nli_label", default="NOT_ENOUGH_INFO")
+
+        # gate: NEI or SOFT => completion
         should_complete = nli_label_pre in ("NOT_ENOUGH_INFO", "SOFT_CONTRADICTION")
-
         logging.info(f"[TF_GATE_NLI] qid={question_id} nli_label={nli_label_pre} should_complete={should_complete}")
 
         if not should_complete:
@@ -391,7 +410,7 @@ def run_pipeline(question: str, q_type: str, question_id: str = None) -> Dict[st
             trace_log["veto_triggered"] = False
             final_context = merged_context
 
-            # Hop1 post-NLI rerun
+            # Hop1 post-NLI rerun (must write label)
             try:
                 post = rerun_tf_nli(
                     statement=question,
@@ -407,22 +426,19 @@ def run_pipeline(question: str, q_type: str, question_id: str = None) -> Dict[st
                 trace_log["tf_nli_best_span_index_post_completion"] = nli_post.get("best_span_index")
                 trace_log["tf_nli_citations_post_completion"] = nli_post.get("citations", []) or []
                 trace_log["tf_nli_explanation_post_completion"] = nli_post.get("explanation", "") or ""
-
                 trace_log["tf_support_top_spans"] = post.get("top_spans", []) or []
                 trace_log["tf_support_top_scores"] = post.get("top_scores", []) or []
-
-                logging.info(f"[TF_POST_NLI_HOP1] qid={question_id} label={trace_log['tf_nli_label_post_completion']}")
             except Exception as e:
                 logging.warning(f"Post-completion TF NLI rerun failed (Hop1): {e}")
 
-            # ----------------------------
-            # ITER-3: Hop2 (Query Rewrite) if still NEI or SOFT_CONTRADICTION
-            # ----------------------------
-            post_label_1 = (trace_log.get("tf_nli_label_post_completion") or "").strip().upper()
-            if post_label_1 in ("NOT_ENOUGH_INFO", "SOFT_CONTRADICTION"):
+            hop1_label = _ensure_tf_label(trace_log, "tf_nli_label_post_completion", default="NOT_ENOUGH_INFO")
+            logging.info(f"[TF_POST_NLI_HOP1] qid={question_id} label={hop1_label}")
+
+            # Hop2 if still NEI or SOFT
+            if hop1_label in ("NOT_ENOUGH_INFO", "SOFT_CONTRADICTION"):
                 trace_log["hop2_triggered"] = True
-                trace_log["hop2_reason"] = post_label_1
-                logging.info(f"[TF_HOP_2] Hop1={post_label_1}. Triggering Hop2 with Query Rewrite...")
+                trace_log["hop2_reason"] = hop1_label
+                logging.info(f"[TF_HOP_2] Hop1={hop1_label}. Triggering Hop2 with Query Rewrite...")
 
                 hop2_query = generate_web_rewrite_query(
                     statement=question,
@@ -431,7 +447,6 @@ def run_pipeline(question: str, q_type: str, question_id: str = None) -> Dict[st
                 trace_log["web_query_used_hop2"] = hop2_query
                 logging.info(f"[TF_HOP_2_QUERY] {hop2_query}")
 
-                # Hop2 local retrieval (important)
                 hop2_local_passages, _, _ = retriever.get_retrieved_passages(
                     hop2_query,
                     top_k=5,
@@ -439,7 +454,6 @@ def run_pipeline(question: str, q_type: str, question_id: str = None) -> Dict[st
                     vector_weight=0.5,
                 )
 
-                # Hop2 web retrieval
                 web_passages_2: List[str] = []
                 try:
                     web_ev_2, _ = research(client=client, target_info=hop2_query, retriever=retriever)
@@ -452,7 +466,6 @@ def run_pipeline(question: str, q_type: str, question_id: str = None) -> Dict[st
                     merged_passages_2 = deduplicate_passages(merged_passages + hop2_local_passages + web_passages_2)
                     final_context = "\n\n".join(merged_passages_2[:18])
 
-                    # Hop2 NLI rerun
                     try:
                         post2 = rerun_tf_nli(
                             statement=question,
@@ -463,77 +476,47 @@ def run_pipeline(question: str, q_type: str, question_id: str = None) -> Dict[st
                             top_k=5,
                         )
                         nli_post2 = (post2.get("nli") or {})
-
                         trace_log["tf_nli_label_hop2"] = (nli_post2.get("label") or "").strip()
                         trace_log["tf_nli_confidence_hop2"] = nli_post2.get("confidence")
                         trace_log["tf_nli_best_span_index_hop2"] = nli_post2.get("best_span_index")
                         trace_log["tf_nli_citations_hop2"] = nli_post2.get("citations", []) or []
                         trace_log["tf_nli_explanation_hop2"] = nli_post2.get("explanation", "") or ""
-
                         trace_log["tf_support_top_spans_hop2"] = post2.get("top_spans", []) or []
                         trace_log["tf_support_top_scores_hop2"] = post2.get("top_scores", []) or []
-
-                        logging.info(f"[TF_POST_NLI_HOP2] qid={question_id} label={trace_log['tf_nli_label_hop2']}")
                     except Exception as e:
                         logging.warning(f"Post-completion TF NLI rerun failed (Hop2): {e}")
 
-        # ----------------------------
-        # TF injection: only if FINAL NLI is decisive (SUPPORTED or HARD_CONTRADICTION)
-        # Decide final label source for injection
-        # ----------------------------
-        nli_label_hop2 = (trace_log.get("tf_nli_label_hop2") or "").strip().upper()
-        nli_label_hop1 = (trace_log.get("tf_nli_label_post_completion") or "").strip().upper()
-        nli_label_pre_u = nli_label_pre
+                hop2_label = _ensure_tf_label(trace_log, "tf_nli_label_hop2", default="NOT_ENOUGH_INFO")
+                logging.info(f"[TF_POST_NLI_HOP2] qid={question_id} label={hop2_label}")
 
-        final_label_for_inject = nli_label_hop2 or nli_label_hop1 or nli_label_pre_u
-        use_hop2_spans = bool(nli_label_hop2)
-
+        # Injection (audit-only): only if decisive
+        final_label_for_inject = _normalize_tf_label(
+            (trace_log.get("tf_nli_label_hop2") or "")
+            or (trace_log.get("tf_nli_label_post_completion") or "")
+            or (trace_log.get("tf_nli_label") or "")
+        )
         if final_label_for_inject in ("SUPPORTED", "HARD_CONTRADICTION"):
-            span = _pick_span_for_injection(trace_log, use_hop2=use_hop2_spans)
-
-            citations_final = []
-            if use_hop2_spans:
-                citations_final = trace_log.get("tf_nli_citations_hop2", []) or []
-            else:
-                citations_final = trace_log.get("tf_nli_citations_post_completion") or trace_log.get("tf_nli_citations", []) or []
-
-            block = build_tf_top_evidence_block(
-                span=span,
-                nli_label=final_label_for_inject,
-                citations=citations_final,
-            )
-            if block:
+            use_hop2 = bool(_normalize_tf_label(trace_log.get("tf_nli_label_hop2", "")))
+            span = _pick_span_for_injection(trace_log, use_hop2=use_hop2)
+            citations = (trace_log.get("tf_nli_citations_hop2") if use_hop2 else trace_log.get("tf_nli_citations_post_completion")) \
+                        or trace_log.get("tf_nli_citations") or []
+            ev_block = build_tf_top_evidence_block(span=span, nli_label=final_label_for_inject, citations=citations)
+            if ev_block:
+                final_context = ev_block + "\n" + (final_context or "")
                 trace_log["tf_support_injected"] = True
-                final_context = block + "\n" + (final_context or "")
 
     else:
-        # MC/QA unchanged gate
-        critic_verify_label = (trace_log.get("critic_verify_label") or "").strip()
+        # MC/QA: keep existing behavior (lightly cleaned)
+        final_context = base_context
+        critic_verify_label = (trace_log.get("critic_verify_label") or "").strip().upper()
         consensus_gap_is_negative = bool(trace_log.get("critic_consensus_gap_is_negative"))
 
-        should_complete = (
-            (not is_sufficient)
-            and (critic_verify_label == "ABSENT")
-            and (not consensus_gap_is_negative)
-        )
-
-        if not should_complete:
-            if is_sufficient:
-                trace_log["completion_skipped_reason"] = "sufficient"
-            else:
-                if consensus_gap_is_negative:
-                    trace_log["completion_skipped_reason"] = "negative_gap"
-                elif critic_verify_label and critic_verify_label != "ABSENT":
-                    trace_log["completion_skipped_reason"] = f"verify_label_{critic_verify_label.lower()}"
-                else:
-                    trace_log["completion_skipped_reason"] = "verify_missing_or_skipped"
-            final_context = base_context
-        else:
+        should_complete = (not is_sufficient) and (critic_verify_label == "ABSENT") and (not consensus_gap_is_negative)
+        if should_complete:
             trace_log["completion_triggered"] = True
             trace_log["completion_reason"] = "critic_insufficient_and_absent"
 
-            completion_query = f"{question}\n\nMissing info to find: {trace_log['missing_info']}".strip()
-
+            completion_query = f"{question}\n\nMissing info to find: {trace_log.get('missing_info','')}".strip()
             gap_passages, _, _ = retriever.get_retrieved_passages(
                 completion_query,
                 top_k=5,
@@ -558,7 +541,6 @@ def run_pipeline(question: str, q_type: str, question_id: str = None) -> Dict[st
             merged_passages = deduplicate_passages(base_passages + gap_passages + web_passages)
             merged_context = "\n\n".join(merged_passages[:15])
 
-            # Court bypass
             logging.info("Step 5: Court auditing BYPASSED.")
             trace_log["court_statement_used"] = (trace_log.get("missing_info") or "").strip() or question
             trace_log["court_verdict"] = "BYPASSED"
@@ -566,40 +548,68 @@ def run_pipeline(question: str, q_type: str, question_id: str = None) -> Dict[st
             trace_log["veto_triggered"] = False
             final_context = merged_context
 
-    # STEP 6: Final Answer
+   # STEP 6: Final Answer
     logging.info("Step 6: Answer Agent generating final output...")
 
     if q_type_u == "TF":
         # final label selection priority: hop2 > hop1(post) > pre
-        final_nli_label = (
+        final_nli_label_raw = (
             (trace_log.get("tf_nli_label_hop2") or "")
             or (trace_log.get("tf_nli_label_post_completion") or "")
             or (trace_log.get("tf_nli_label") or "")
-        ).strip().upper()
-
-        if trace_log.get("tf_nli_label_hop2"):
-            trace_log["tf_final_answer_source"] = "NLI_HOP2"
-        elif trace_log.get("tf_nli_label_post_completion"):
-            trace_log["tf_final_answer_source"] = "NLI_HOP1"
+        )
+        final_nli_label = _normalize_tf_label(final_nli_label_raw)
+        
+        if final_nli_label not in TF_LABELS:
+            final_nli_label = "NOT_ENOUGH_INFO"
+            trace_log["tf_final_answer_source"] = "FALLBACK"
         else:
-            trace_log["tf_final_answer_source"] = "NLI_PRE"
+            if _normalize_tf_label(trace_log.get("tf_nli_label_hop2", "")):
+                trace_log["tf_final_answer_source"] = "NLI_HOP2"
+            elif _normalize_tf_label(trace_log.get("tf_nli_label_post_completion", "")):
+                trace_log["tf_final_answer_source"] = "NLI_HOP1"
+            else:
+                trace_log["tf_final_answer_source"] = "NLI_PRE"
 
         trace_log["tf_final_nli_label_used"] = final_nli_label
 
+        # -------------------------------------------------------------
+        # 混合路由决策：确定性拦截 vs 泛化推理
+        # -------------------------------------------------------------
         if final_nli_label == "SUPPORTED":
-            final_answer = "Yes"
+            locked_answer = "Yes"
+            is_locked = True
         elif final_nli_label == "HARD_CONTRADICTION":
-            final_answer = "No"
+            locked_answer = "No"
+            is_locked = True
         else:
-            # SOFT_CONTRADICTION / NOT_ENOUGH_INFO / unknown
-            final_answer = "No"
-            if final_nli_label not in ("SOFT_CONTRADICTION", "NOT_ENOUGH_INFO"):
-                trace_log["tf_final_answer_source"] = "FALLBACK"
+            # 针对 NOT_ENOUGH_INFO 和 SOFT_CONTRADICTION 解锁
+            locked_answer = None
+            is_locked = False
 
-        logging.info(f"[TF_FINAL_MAPPING] qid={question_id} label={final_nli_label} -> {final_answer}")
+        trace_log["tf_answer_llm_locked"] = is_locked
 
+        if is_locked:
+            # 走快速/确定性通道：无视上下文，只做强制格式化 (gpt-4o-mini)
+            logging.info(f"[TF_FINAL_MAPPING_LOCKED] qid={question_id} label={final_nli_label} -> {locked_answer}")
+            final_answer = generate_tf_final_answer_locked(
+                client=client,
+                question=question,
+                context=final_context,
+                locked_answer=locked_answer,
+                model_name="gpt-4o-mini",
+            )
+        else:
+            # 走推理通道：释放给智能体，带入完整 Context 让其自由推断 (gpt-4o)
+            logging.info(f"[TF_FINAL_MAPPING_UNLOCKED] qid={question_id} label={final_nli_label} -> Delegating to LLM reasoning")
+            final_answer = generate_final_answer(
+                client=client,
+                question=question,
+                context=final_context,
+                q_type=q_type,
+                model_name="gpt-4o", 
+            )
     else:
-        # MC / QA unchanged
         final_answer = generate_final_answer(
             client=client,
             question=question,

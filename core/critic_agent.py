@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Critic Agent (Sufficiency Gate) — Logged ItV + VerifyLocate (Scheme 3) + TF NLI (Iter-2)
+Critic Agent (Sufficiency Gate) — Logged ItV + VerifyLocate (Scheme 3) + TF NLI (Iter-3 compatible)
 
 MC/QA: keep original ItV + gap VerifyLocate behavior.
 
-TF (Iter-2):
+TF:
 - Always run statement-support Locate to extract top-K candidate spans (K=5).
 - Run ONE batched NLI call (gpt-4o-mini) over the K spans:
-    output: SUPPORTED / CONTRADICTED / NOT_ENOUGH_INFO
+    output: SUPPORTED / HARD_CONTRADICTION / NOT_ENOUGH_INFO
 - TF final_is_sufficient is derived from NLI (not from cross-encoder score).
 - Trace includes tf_nli_* fields for orchestrator gating and answer injection.
 
@@ -51,7 +51,6 @@ _emb_model: Optional[SentenceTransformer] = None
 _oai_client: Optional[OpenAI] = None
 _gem_client = None
 
-# TF Iter-2 knobs
 TF_LOCATE_TOPK = 5
 TF_NLI_MODEL = "gpt-4o-mini"
 
@@ -104,7 +103,7 @@ SYS_ID_QA = (
 
 
 # ----------------------------
-# Helpers: Identify parsing
+# Helpers
 # ----------------------------
 def _is_empty(x: str) -> bool:
     return (x is None) or (not str(x).strip())
@@ -142,6 +141,19 @@ def _gap_is_negative(gap: str) -> bool:
         "the context does not",
     ]
     return any(m in g for m in neg_markers)
+
+
+def _normalize_tf_label_iter3(label: str) -> str:
+    """
+    Normalize any TF label to orchestrator Iter-3 protocol.
+    """
+    lab = (label or "").strip().upper()
+    if lab in ("CONTRADICTED", "HARD_CONTRADICTION"):
+        return "HARD_CONTRADICTION"
+    if lab in ("SUPPORTED", "NOT_ENOUGH_INFO"):
+        return lab
+    # We don't produce SOFT_CONTRADICTION in this critic; unknown => safest.
+    return "NOT_ENOUGH_INFO"
 
 
 # ----------------------------
@@ -193,7 +205,7 @@ def _make_sentence_windows(context: str, window_sents: int = 2, max_spans: int =
     w = max(1, int(window_sents))
     spans: List[str] = []
     for i in range(len(sents)):
-        chunk = " ".join(sents[i : i + w]).strip()
+        chunk = " ".join(sents[i: i + w]).strip()
         if chunk:
             spans.append(chunk)
         if len(spans) >= max_spans:
@@ -202,10 +214,6 @@ def _make_sentence_windows(context: str, window_sents: int = 2, max_spans: int =
 
 
 def _score_span(retriever, query: str, span: str) -> float:
-    """
-    Use AdvancedRetriever.score_text as-is (raw cross-encoder score).
-    We treat it as a ranking score only (NOT a calibrated probability).
-    """
     try:
         return float(retriever.score_text(query=query, text=span))
     except TypeError:
@@ -250,9 +258,6 @@ def _verify_locate_with_reranker(
     max_spans: int = 120,
     threshold: float = 0.55,
 ) -> Dict[str, Any]:
-    """
-    Kept for MC/QA gap verify (uses raw score threshold historically).
-    """
     spans = _make_sentence_windows(context, window_sents=window_sents, max_spans=max_spans)
     if not spans or retriever is None:
         return {
@@ -285,7 +290,7 @@ def _verify_locate_with_reranker(
 
 
 # ----------------------------
-# TF NLI (Iter-2)
+# TF NLI
 # ----------------------------
 def _tf_nli_judge(statement: str, spans: List[str]) -> Dict[str, Any]:
     """
@@ -293,10 +298,10 @@ def _tf_nli_judge(statement: str, spans: List[str]) -> Dict[str, Any]:
 
     Output schema:
       {
-        "label": "SUPPORTED" | "CONTRADICTED" | "NOT_ENOUGH_INFO",
+        "label": "SUPPORTED" | "HARD_CONTRADICTION" | "NOT_ENOUGH_INFO",
         "confidence": 0..1,
         "best_span_index": int | null,
-        "citations": [str],  # exact quotes from spans
+        "citations": [str],
         "explanation": str
       }
     """
@@ -305,7 +310,7 @@ def _tf_nli_judge(statement: str, spans: List[str]) -> Dict[str, Any]:
     system = (
         "You are a strict NLI judge for medical QA. "
         "Given a STATEMENT and EVIDENCE SPANS, decide whether the evidence SUPPORTS the statement, "
-        "CONTRADICTS the statement, or is NOT_ENOUGH_INFO. "
+        "HARD_CONTRADICTION (directly contradicts), or is NOT_ENOUGH_INFO. "
         "Rules: Only use the provided spans. Do NOT use outside knowledge. "
         "If the spans are merely topically related but do not directly support or contradict the statement, choose NOT_ENOUGH_INFO. "
         "Return JSON ONLY matching the schema."
@@ -321,7 +326,7 @@ def _tf_nli_judge(statement: str, spans: List[str]) -> Dict[str, Any]:
         f"EVIDENCE SPANS (top-K):\n" + "\n\n".join(evidence_block) + "\n\n"
         "JSON SCHEMA:\n"
         "{\n"
-        '  "label": "SUPPORTED" | "CONTRADICTED" | "NOT_ENOUGH_INFO",\n'
+        '  "label": "SUPPORTED" | "HARD_CONTRADICTION" | "NOT_ENOUGH_INFO",\n'
         '  "confidence": number,\n'
         '  "best_span_index": number | null,\n'
         '  "citations": string[],\n'
@@ -344,7 +349,6 @@ def _tf_nli_judge(statement: str, spans: List[str]) -> Dict[str, Any]:
     try:
         data = json.loads(txt)
     except Exception:
-        # hard fallback
         data = {
             "label": "NOT_ENOUGH_INFO",
             "confidence": 0.0,
@@ -353,10 +357,11 @@ def _tf_nli_judge(statement: str, spans: List[str]) -> Dict[str, Any]:
             "explanation": f"Failed to parse JSON from model output: {txt[:200]}",
         }
 
-    # normalize
-    label = str(data.get("label", "NOT_ENOUGH_INFO")).strip().upper()
-    if label not in ("SUPPORTED", "CONTRADICTED", "NOT_ENOUGH_INFO"):
-        label = "NOT_ENOUGH_INFO"
+    label_raw = str(data.get("label", "NOT_ENOUGH_INFO")).strip().upper()
+    # accept legacy "CONTRADICTED"
+    if label_raw == "CONTRADICTED":
+        label_raw = "HARD_CONTRADICTION"
+    label = _normalize_tf_label_iter3(label_raw)
 
     try:
         conf = float(data.get("confidence", 0.0))
@@ -480,7 +485,7 @@ def evaluate_sufficiency(
         "verify_n_spans": None,
         "verify_window_sents": verify_window_sents,
 
-        # TF locate + NLI (Iter-2)
+        # TF locate + NLI
         "tf_support_verify_label": "SKIPPED",
         "tf_support_best_score": None,
         "tf_support_best_span": "",
@@ -490,14 +495,14 @@ def evaluate_sufficiency(
         "tf_support_top_spans": [],
         "tf_support_top_scores": [],
 
-        "tf_nli_label": "",
-        "tf_nli_confidence": None,
+        # IMPORTANT: default to NEI so it is never empty on crash paths
+        "tf_nli_label": "NOT_ENOUGH_INFO",
+        "tf_nli_confidence": 0.0,
         "tf_nli_best_span_index": None,
         "tf_nli_citations": [],
         "tf_nli_explanation": "",
         "tf_nli_raw": None,
 
-        # final
         "final_is_sufficient": True,
         "final_missing_info": "",
         "md_path": "",
@@ -509,9 +514,7 @@ def evaluate_sufficiency(
         if retriever is None:
             raise ValueError("evaluate_sufficiency requires retriever for VerifyLocate scoring.")
 
-        # ----------------------------
-        # Identify stage (kept for MC; TF kept for logging/query hints)
-        # ----------------------------
+        # Identify stage
         if q_type_u == "MC":
             sys_id = SYS_ID_MC
             user_prompt = f"Context:\n{context}\n\nQuestion:\n{question}"
@@ -556,9 +559,7 @@ def evaluate_sufficiency(
         trace["valid_gaps"] = valid_gaps
         trace["invalid_gaps"] = invalid_gaps
 
-        # ----------------------------
-        # MC/QA early-exit on NONE fraction (unchanged)
-        # ----------------------------
+        # MC/QA early exit
         if q_type_u != "TF" and trace["none_frac_strict"] >= 0.6:
             trace["final_is_sufficient"] = True
             trace["final_missing_info"] = ""
@@ -576,9 +577,7 @@ def evaluate_sufficiency(
             write_jsonl("critic", "critic_traces.jsonl", trace)
             return True, "", trace
 
-        # ----------------------------
-        # Consensus gap (kept for MC gate; TF kept as hint)
-        # ----------------------------
+        # Consensus gap
         consensus_gap = ""
         if valid_gaps:
             emb = get_emb_model()
@@ -613,9 +612,7 @@ def evaluate_sufficiency(
                 "n_invalid_gaps": len(invalid_gaps),
             }
 
-        # ----------------------------
-        # Gap VerifyLocate (MC/QA) — unchanged
-        # ----------------------------
+        # Gap VerifyLocate (MC/QA)
         gap_missing = False
         if consensus_gap:
             trace["verify_mode"] = "locate_reranker"
@@ -642,11 +639,8 @@ def evaluate_sufficiency(
                 trace["consensus_debug"]["verify_decision"] = "ABSENT->INSUFFICIENT"
                 gap_missing = True
 
-        # ----------------------------
-        # TF: Retrieve-then-Read NLI (Iter-2)
-        # ----------------------------
+        # TF: Locate + NLI
         if q_type_u == "TF":
-            # Locate top-K spans for the statement
             loc = _locate_topk_spans(
                 retriever=retriever,
                 query=question,
@@ -664,48 +658,40 @@ def evaluate_sufficiency(
             trace["tf_support_window_sents"] = loc.get("window_sents", verify_window_sents)
             trace["tf_support_threshold"] = verify_threshold
 
-            # Keep legacy fields for orchestrator compatibility (best-of-topK)
             if top_spans:
                 trace["tf_support_best_span"] = top_spans[0]
                 trace["tf_support_best_score"] = top_scores[0] if top_scores else None
-                trace["tf_support_verify_label"] = "PRESENT"  # "present" as in "we found a top span"
+                trace["tf_support_verify_label"] = "PRESENT"
             else:
                 trace["tf_support_best_span"] = ""
                 trace["tf_support_best_score"] = None
                 trace["tf_support_verify_label"] = "ABSENT"
 
-            # NLI judge over top-K spans
             nli = _tf_nli_judge(statement=question, spans=top_spans)
-            trace["tf_nli_label"] = nli.get("label", "")
-            trace["tf_nli_confidence"] = nli.get("confidence")
+            trace["tf_nli_label"] = _normalize_tf_label_iter3(nli.get("label", ""))
+            trace["tf_nli_confidence"] = nli.get("confidence", 0.0)
             trace["tf_nli_best_span_index"] = nli.get("best_span_index")
             trace["tf_nli_citations"] = nli.get("citations", [])
             trace["tf_nli_explanation"] = nli.get("explanation", "")
             trace["tf_nli_raw"] = nli.get("raw_json")
 
-        # ----------------------------
         # Final decision
-        # ----------------------------
         if q_type_u == "TF":
-            # TF sufficiency is defined by NLI (SUPPORTED / CONTRADICTED are sufficient to decide;
-            # NOT_ENOUGH_INFO is insufficient).
-            nli_label = (trace.get("tf_nli_label") or "").strip().upper()
-            sufficient = nli_label in ("SUPPORTED", "CONTRADICTED")
+            nli_label = _normalize_tf_label_iter3(trace.get("tf_nli_label"))
+            trace["tf_nli_label"] = nli_label
+            sufficient = nli_label in ("SUPPORTED", "HARD_CONTRADICTION")
 
             trace["final_is_sufficient"] = bool(sufficient)
             if sufficient:
                 trace["final_missing_info"] = ""
                 is_sufficient, missing_info = True, ""
             else:
-                # anchor missing_info to statement + optional gap hint (for completion query)
                 if consensus_gap:
                     trace["final_missing_info"] = f"{question}\n\nHint gap: {consensus_gap}"
                 else:
                     trace["final_missing_info"] = question
                 is_sufficient, missing_info = False, trace["final_missing_info"]
-
         else:
-            # MC/QA unchanged
             if consensus_gap and gap_missing:
                 trace["final_is_sufficient"] = False
                 trace["final_missing_info"] = consensus_gap
@@ -722,20 +708,35 @@ def evaluate_sufficiency(
         return is_sufficient, missing_info, trace
 
     except Exception as e:
+        # HARDENED: TF must never fail-safe to "sufficient"
         trace["error"] = str(e)
         trace["traceback"] = traceback.format_exc()
+
+        if q_type_u == "TF":
+            trace["tf_nli_label"] = _normalize_tf_label_iter3(trace.get("tf_nli_label") or "NOT_ENOUGH_INFO")
+            trace["tf_nli_confidence"] = trace.get("tf_nli_confidence", 0.0) or 0.0
+            trace["final_is_sufficient"] = False
+            trace["final_missing_info"] = question
+            trace["consensus_debug"] = {"decision": "FAIL_SAFE_TF_NEI_ON_ERROR"}
+            try:
+                md = _format_itv_markdown(trace)
+                trace["md_path"] = write_text("critic", f"{item_id}.md", md)
+                write_jsonl("critic", "critic_traces.jsonl", trace)
+            except Exception:
+                pass
+            return False, question, trace
+
         trace["final_is_sufficient"] = True
         trace["final_missing_info"] = ""
         trace["consensus_debug"] = {"decision": "FAIL_SAFE_SUFFICIENT_ON_ERROR"}
-
         try:
             md = _format_itv_markdown(trace)
             trace["md_path"] = write_text("critic", f"{item_id}.md", md)
             write_jsonl("critic", "critic_traces.jsonl", trace)
         except Exception:
             pass
-
         return True, "", trace
+
 
 # ----------------------------
 # Public helper (for orchestrator)
@@ -748,19 +749,6 @@ def rerun_tf_nli(
     max_spans: int = 120,
     top_k: int = TF_LOCATE_TOPK,
 ) -> Dict[str, Any]:
-    """
-    Re-run TF Locate + NLI on a given context (typically post-completion final_context),
-    without re-running Identify/VerifyLocate for MC.
-
-    Returns:
-      {
-        "top_spans": [str],
-        "top_scores": [float],
-        "n_spans": int|None,
-        "window_sents": int,
-        "nli": {label/confidence/best_span_index/citations/explanation/raw_json}
-      }
-    """
     loc = _locate_topk_spans(
         retriever=retriever,
         query=statement,
