@@ -4,6 +4,10 @@ Answer Agent
 Role: The final component of the pipeline. Receives the "Final Context" from the Orchestrator
 and the question, then strictly generates the final option (A/B/C/D/E), binary judgment (Yes/No),
 or a concise factual answer (for open-ended QA). Contains no batch-processing loops; acts as a pure logic module.
+
+Hardened TF mode:
+- generate_tf_final_answer_locked still CALLS an LLM (business requirement),
+  but it is used only as a strict formatter and is NOT allowed to flip the deterministic decision.
 """
 
 import time
@@ -11,6 +15,7 @@ import re
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 def _chat_with_retry(client, model, messages, temperature=0.0, max_tokens=10, max_retries=4, base_delay=1.5):
     """API call execution with exponential backoff for transient errors."""
@@ -31,10 +36,82 @@ def _chat_with_retry(client, model, messages, temperature=0.0, max_tokens=10, ma
                 time.sleep(base_delay * (2 ** attempt))
     raise last_err
 
+
+def _normalize_yesno(s: str) -> str:
+    t = (s or "").strip()
+    if not t:
+        return ""
+    up = re.sub(r"[^A-Z]", "", t.upper())
+    if up in ("YES", "Y", "TRUE", "T"):
+        return "Yes"
+    if up in ("NO", "N", "FALSE", "F"):
+        return "No"
+    return ""
+
+
+def generate_tf_final_answer_locked(
+    client,
+    question: str,
+    context: str,
+    locked_answer: str,
+    model_name: str = "gpt-4o-mini",
+) -> str:
+    """
+    TF-only: still calls an LLM, but forces the model to output exactly the locked_answer.
+
+    IMPORTANT: We intentionally do NOT provide the retrieved context to the formatter model.
+    The decision is already deterministic; the LLM is only for the "must end with an LLM answer"
+    requirement and formatting stability.
+
+    Returns: exactly "Yes" or "No" (falls back to locked_answer if non-compliant).
+    """
+    locked = _normalize_yesno(locked_answer)
+    if locked not in ("Yes", "No"):
+        locked = "No"  # defensive default
+
+    system_prompt = (
+        "You are a strict output formatter.\n"
+        "You MUST output EXACTLY the provided LOCKED_ANSWER.\n"
+        "You are NOT allowed to change it.\n"
+        "Output must be EXACTLY one token: Yes or No.\n"
+        "Do not output any other text."
+    )
+
+    # Do NOT include context. Keep prompt minimal to prevent leakage or noncompliance.
+    user_content = f"LOCKED_ANSWER: {locked}\nOutput:"
+
+    try:
+        response = _chat_with_retry(
+            client=client,
+            model=model_name,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0.0,
+            max_tokens=2,
+        )
+        out = (response.choices[0].message.content or "").strip()
+        norm = _normalize_yesno(out)
+
+        if norm in ("Yes", "No") and norm == locked:
+            return norm
+
+        logging.warning(
+            f"[TF_RENDER_LOCKED] Non-compliant LLM output '{out}'. Falling back to locked_answer='{locked}'."
+        )
+        return locked
+    except Exception as e:
+        logging.error(
+            f"[TF_RENDER_LOCKED] Answer Agent API error: {e}. Falling back to locked_answer='{locked}'."
+        )
+        return locked
+
+
 def generate_final_answer(client, question: str, context: str, q_type: str, model_name: str = "gpt-4o") -> str:
     """
     Generates the final answer based on the provided final context.
-    
+
     :param client: OpenAI client instance.
     :param question: The original question (should include Options text if MC).
     :param context: The final context after completion and court verification.
@@ -42,12 +119,12 @@ def generate_final_answer(client, question: str, context: str, q_type: str, mode
     :param model_name: The LLM used for generation (defaults to gpt-4o).
     :return: The extracted final answer.
     """
-    
+
     # =========================================================================
     # 1. System Prompt Routing
     # =========================================================================
     if q_type == "QA":
-        # New empathetic & constrained Caregiver Assistant Prompt for Open-Ended QA
+        # Empathetic & constrained caregiver assistant prompt for Open-Ended QA
         system_prompt = (
             "You are a supportive expert assistant for dementia caregivers. Rules:\n"
             "1. Language: Simple 8th-grade level.\n"
@@ -61,7 +138,7 @@ def generate_final_answer(client, question: str, context: str, q_type: str, mode
             "Do NOT say 'As a physician...' or 'I recommend this treatment...'"
         )
     else:
-        # Original strict academic Prompt for MC and TF Benchmarks
+        # Strict academic prompt for MC and TF Benchmarks
         system_prompt = (
             "You are an expert medical AI assistant specializing in Alzheimer's Disease and Related Dementias (ADRD). "
             "Your core directive is to answer the user's question STRICTLY based on the provided retrieved context. "
@@ -72,7 +149,7 @@ def generate_final_answer(client, question: str, context: str, q_type: str, mode
     # 2. User Prompt Assembly
     # =========================================================================
     user_content = f"--- Retrieved Context ---\n{context}\n\n--- Question ---\n{question}\n\n"
-    
+
     strict_instruction = (
         "--- INSTRUCTIONS ---\n"
         "1. GROUNDING: Answer STRICTLY based on the provided context. Do NOT use outside knowledge.\n"
@@ -93,11 +170,8 @@ def generate_final_answer(client, question: str, context: str, q_type: str, mode
             "3. Your output must be EXACTLY ONE option letter (A, B, C, D, or E) — the one best supported by the context."
         )
     elif q_type == "QA":
-        strict_instruction += (
-            "2. Provide a supportive, concise, and factual answer based ONLY on the context."
-        )
-        # Bumped to 250 to ensure the 150-word constraint isn't abruptly cut off by API token limits
-        target_max_tokens = 250  
+        strict_instruction += "2. Provide a supportive, concise, and factual answer based ONLY on the context."
+        target_max_tokens = 250  # allow room for the 150-word constraint
 
     user_content += strict_instruction
 
@@ -112,8 +186,8 @@ def generate_final_answer(client, question: str, context: str, q_type: str, mode
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
             ],
-            temperature=0.0,  # Kept at 0.0 for absolute formatting stability
-            max_tokens=target_max_tokens 
+            temperature=0.0,
+            max_tokens=target_max_tokens,
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -128,7 +202,6 @@ def check_accuracy(generated: str, ground_truth: str, correct_letter: str, q_typ
     generated_clean = generated.strip().upper()
 
     if q_type == "TF":
-        # Strip out punctuation for binary evaluation
         generated_clean = re.sub(r'[^A-Z]', '', generated_clean)
         gt = ground_truth.strip().upper()
         if gt in ["YES", "TRUE"]:
@@ -136,17 +209,14 @@ def check_accuracy(generated: str, ground_truth: str, correct_letter: str, q_typ
         if gt in ["NO", "FALSE"]:
             return generated_clean in ["NO", "FALSE", "N", "F"]
         return generated_clean == gt
-        
+
     elif q_type == "MC":
-        # Strip out punctuation and capture the first valid letter
         generated_clean = re.sub(r'[^A-Z]', '', generated_clean)
         if generated_clean and generated_clean[0] in "ABCDE":
             return generated_clean[0] == correct_letter.strip().upper()
         return False
-        
+
     elif q_type == "QA":
-        # For open-ended questions, perform a lenient inclusion check.
-        # Note: For highly rigorous QA evaluation, an LLM-as-a-judge method is recommended over string matching.
         gt_clean = ground_truth.strip().lower()
         gen_clean_lower = generated.strip().lower()
         return gt_clean in gen_clean_lower

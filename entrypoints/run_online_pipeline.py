@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Online Pipeline Batch Runner
-Role: Handles two distinct execution modes:
-1. Benchmark Mode (JSONs): Evaluates ADRD MC/TF questions, calculates accuracy, and prints a report.
-2. Inference Mode (CSV): Processes a custom dataset (e.g., 500 QA questions), appends the generated 
-   answers and retrieved contexts as new columns to the original CSV, and exports it for later quality evaluation.
+Online Pipeline Batch Runner (entrypoints/)
+Role:
+1) Benchmark Mode (JSONs): Evaluate ADRD MC/TF, calculate accuracy, export CSV (with full Retrieved_Context and traces).
+2) Inference Mode (CSV): Process custom CSV, append answers + contexts + traces.
+
+Enhancement:
+- Add --ids for Benchmark Mode to run specified question IDs (from the JSON "ID" field).
+  Example:
+    python entrypoints/run_online_pipeline.py --subset mc --ids 6,8,13,21,29
 """
 
 import os
@@ -13,21 +17,47 @@ import json
 import argparse
 import logging
 from datetime import datetime
+from typing import Optional, Set, List, Dict, Any
+
 import pandas as pd
 from tqdm import tqdm
 
-# Ensure project root is in the Python path
+# -----------------------------------------------------------------------------
+# Path setup: entrypoints/ is sibling of core/ and data/
+# -----------------------------------------------------------------------------
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, PROJECT_ROOT)
 
 from core.orchestrator import run_pipeline
 from core.answer_agent import check_accuracy
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-def load_json_benchmarks(subset="all"):
-    """Loads MC and TF benchmark records from JSON files for accuracy evaluation."""
-    records = []
+
+def _parse_ids(ids_str: Optional[str]) -> Optional[Set[int]]:
+    """
+    Parse comma-separated ids like "6,8,13" into a set of ints.
+    Returns None if ids_str is None/empty.
+    """
+    if not ids_str:
+        return None
+    parts = [p.strip() for p in ids_str.split(",") if p.strip()]
+    out: Set[int] = set()
+    for p in parts:
+        try:
+            out.add(int(p))
+        except ValueError:
+            raise ValueError(f"--ids must be comma-separated integers. Bad token: '{p}'")
+    return out
+
+
+def load_json_benchmarks(subset: str = "all", allowed_ids: Optional[Set[int]] = None) -> pd.DataFrame:
+    """
+    Loads MC and TF benchmark records from JSON files for accuracy evaluation.
+
+    If allowed_ids is provided, filter items by their numeric JSON field "ID".
+    """
+    records: List[dict] = []
     data_dir = os.path.join(PROJECT_ROOT, "data")
     mc_path = os.path.join(data_dir, "ADRD_Caregiving_Multiple_Choice.json")
     tf_path = os.path.join(data_dir, "ADRD_Caregiving_True_or_False.json")
@@ -36,48 +66,152 @@ def load_json_benchmarks(subset="all"):
     if subset in ("mc", "all") and os.path.exists(mc_path):
         with open(mc_path, encoding="utf-8") as f:
             mc_data = json.load(f)
-        for item in mc_data["data"]:
-            q_id = f"ADRD_MC_{item['ID']:03d}"
+        for item in mc_data.get("data", []):
+            q_num = int(item.get("ID"))
+            if allowed_ids is not None and q_num not in allowed_ids:
+                continue
+
+            q_id = f"ADRD_MC_{q_num:03d}"
             q_text = item["Question"]
             options = item.get("Options", {})
             ans_letter = item["Answer"]
             ground_truth_text = options.get(ans_letter, ans_letter)
             options_str = "\n".join([f"  {k}. {v}" for k, v in options.items()])
             formatted_q = f"{q_text}\n\nOptions:\n{options_str}\n"
-            
-            records.append({
-                "Question_ID": q_id,
-                "Type": "MC",
-                "Question": formatted_q,
-                "Ground_Truth_Answer": ground_truth_text,
-                "Correct_Letter": ans_letter,
-            })
+
+            records.append(
+                {
+                    "Question_ID": q_id,
+                    "Type": "MC",
+                    "Question": formatted_q,
+                    "Ground_Truth_Answer": ground_truth_text,
+                    "Correct_Letter": ans_letter,
+                    "Numeric_ID": q_num,
+                }
+            )
 
     # Load True/False JSON
     if subset in ("tf", "all") and os.path.exists(tf_path):
         with open(tf_path, encoding="utf-8") as f:
             tf_data = json.load(f)
-        for item in tf_data["data"]:
-            q_id = f"ADRD_TF_{item['ID']:03d}"
+        for item in tf_data.get("data", []):
+            q_num = int(item.get("ID"))
+            if allowed_ids is not None and q_num not in allowed_ids:
+                continue
+
+            q_id = f"ADRD_TF_{q_num:03d}"
             q_text = item["Question"]
             ground_truth = item["Answer"]
             formatted_q = f"True or False statement: {q_text}\n"
-            
-            records.append({
-                "Question_ID": q_id,
-                "Type": "TF",
-                "Question": formatted_q,
-                "Ground_Truth_Answer": ground_truth,
-                "Correct_Letter": ground_truth,
-            })
 
-    return pd.DataFrame(records)
+            records.append(
+                {
+                    "Question_ID": q_id,
+                    "Type": "TF",
+                    "Question": formatted_q,
+                    "Ground_Truth_Answer": ground_truth,
+                    "Correct_Letter": ground_truth,
+                    "Numeric_ID": q_num,
+                }
+            )
 
-def run_benchmark_mode(subset, limit):
+    df = pd.DataFrame(records)
+    if not df.empty and "Numeric_ID" in df.columns:
+        df = df.sort_values(["Type", "Numeric_ID"], ascending=[True, True]).reset_index(drop=True)
+    return df
+
+
+def _extract_trace_fields(pipeline_output: dict) -> Dict[str, Any]:
+    """
+    Flatten useful fields from pipeline_output into CSV-friendly columns,
+    aligned to current core/orchestrator.py trace schema (Iter-3).
+    """
+    trace = (pipeline_output or {}).get("trace", {}) if isinstance(pipeline_output, dict) else {}
+    out: Dict[str, Any] = {}
+
+    # Context for audit (FULL)
+    out["Retrieved_Context"] = (pipeline_output or {}).get("final_context", "")
+
+    # -------------------------
+    # Orchestrator-level fields
+    # -------------------------
+    out["Completion_Triggered"] = trace.get("completion_triggered", False)
+    out["Completion_Reason"] = trace.get("completion_reason", "")
+    out["Completion_Skipped_Reason"] = trace.get("completion_skipped_reason", "")
+
+    out["Web_Query_Used_Hop1"] = trace.get("web_query_used", "")
+    out["Web_Query_Used_Hop2"] = trace.get("web_query_used_hop2", "")
+    out["Hop2_Triggered"] = trace.get("hop2_triggered", False)
+    out["Hop2_Reason"] = trace.get("hop2_reason", "")
+
+    out["Court_Statement_Used"] = trace.get("court_statement_used", "")
+    out["Court_Verdict"] = trace.get("court_verdict", "N/A")
+    out["Veto_Triggered"] = trace.get("veto_triggered", False)
+
+    # -------------------------
+    # Critic-level audit fields
+    # -------------------------
+    out["Critic_Is_Sufficient"] = trace.get("is_sufficient")
+    out["Critic_Missing_Info"] = trace.get("missing_info", "")
+
+    out["Critic_Decision"] = trace.get("critic_decision", "")
+    out["Critic_None_Frac_Strict"] = trace.get("critic_none_frac_strict")
+    out["Critic_Empty_Frac"] = trace.get("critic_empty_frac")
+    out["Critic_Invalid_Gap_Frac"] = trace.get("critic_invalid_gap_frac")
+
+    out["Critic_Consensus_Gap"] = trace.get("critic_consensus_gap", "")
+    out["Critic_Consensus_Gap_Is_Negative"] = trace.get("critic_consensus_gap_is_negative", None)
+
+    out["Critic_Verify_Mode"] = trace.get("critic_verify_mode", "")
+    out["Critic_Verify_Label"] = trace.get("critic_verify_label", "")
+    out["Critic_Verify_Best_Score"] = trace.get("critic_verify_best_score", None)
+    out["Critic_Verify_Threshold"] = trace.get("critic_verify_threshold", None)
+    out["Critic_Verify_Best_Span"] = trace.get("critic_verify_best_span", "")
+    out["Critic_Verify_N_Spans"] = trace.get("critic_verify_n_spans", None)
+    out["Critic_Verify_Window_Sents"] = trace.get("critic_verify_window_sents", None)
+
+    out["Critic_MD_Path"] = trace.get("critic_md_path", "")
+
+    # -------------------------
+    # TF Iter-3 diagnostics
+    # -------------------------
+    out["TF_Support_Injected"] = trace.get("tf_support_injected", False)
+
+    # pre (from critic)
+    out["TF_NLI_Label_Pre"] = trace.get("tf_nli_label", "")
+    out["TF_NLI_Confidence_Pre"] = trace.get("tf_nli_confidence", None)
+    out["TF_NLI_Best_Span_Index_Pre"] = trace.get("tf_nli_best_span_index", None)
+    out["TF_NLI_Explanation_Pre"] = trace.get("tf_nli_explanation", "")
+    out["TF_NLI_Citations_Pre"] = json.dumps(trace.get("tf_nli_citations", []) or [], ensure_ascii=False)
+
+    # hop1 post completion
+    out["TF_NLI_Label_Hop1"] = trace.get("tf_nli_label_post_completion", "")
+    out["TF_NLI_Confidence_Hop1"] = trace.get("tf_nli_confidence_post_completion", None)
+    out["TF_NLI_Best_Span_Index_Hop1"] = trace.get("tf_nli_best_span_index_post_completion", None)
+    out["TF_NLI_Explanation_Hop1"] = trace.get("tf_nli_explanation_post_completion", "")
+    out["TF_NLI_Citations_Hop1"] = json.dumps(trace.get("tf_nli_citations_post_completion", []) or [], ensure_ascii=False)
+
+    # hop2
+    out["TF_NLI_Label_Hop2"] = trace.get("tf_nli_label_hop2", "")
+    out["TF_NLI_Confidence_Hop2"] = trace.get("tf_nli_confidence_hop2", None)
+    out["TF_NLI_Best_Span_Index_Hop2"] = trace.get("tf_nli_best_span_index_hop2", None)
+    out["TF_NLI_Explanation_Hop2"] = trace.get("tf_nli_explanation_hop2", "")
+    out["TF_NLI_Citations_Hop2"] = json.dumps(trace.get("tf_nli_citations_hop2", []) or [], ensure_ascii=False)
+
+    # final TF decision
+    out["TF_Final_NLI_Label_Used"] = trace.get("tf_final_nli_label_used", "")
+    out["TF_Final_Answer_Source"] = trace.get("tf_final_answer_source", "")
+
+    return out
+
+
+def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str]):
     """Executes the pipeline on JSON datasets and generates an Accuracy Report."""
-    df_questions = load_json_benchmarks(subset)
+    allowed_ids = _parse_ids(ids_str)
+
+    df_questions = load_json_benchmarks(subset=subset, allowed_ids=allowed_ids)
     if df_questions.empty:
-        logging.error("No JSON benchmark questions found in data/ folder.")
+        logging.error("No JSON benchmark questions found (or none matched --ids).")
         return
 
     if limit > 0:
@@ -86,68 +220,74 @@ def run_benchmark_mode(subset, limit):
     output_dir = os.path.join(PROJECT_ROOT, "evaluation_results")
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_csv = os.path.join(output_dir, f"benchmark_eval_{subset}_{timestamp}.csv")
+    ids_tag = ""
+    if allowed_ids is not None:
+        ids_sorted = ",".join(str(x) for x in sorted(allowed_ids))
+        ids_tag = f"_ids_{ids_sorted.replace(',', '-')}"
+    output_csv = os.path.join(output_dir, f"benchmark_eval_{subset}_{timestamp}{ids_tag}.csv")
 
     print(f"\n🚀 [BENCHMARK MODE] Evaluating {len(df_questions)} questions...")
-    
+
     results = []
     checkpoint_every = 10
 
     for idx, row in tqdm(df_questions.iterrows(), total=len(df_questions), desc="Running Benchmarks"):
         qid = row["Question_ID"]
         q_type = row["Type"]
-        
+        question_text = row["Question"]
+
         try:
-            pipeline_output = run_pipeline(question=row["Question"], q_type=q_type)
-            generated_answer = pipeline_output["final_answer"]
-            
+            pipeline_output = run_pipeline(question=question_text, q_type=q_type, question_id=qid)
+            generated_answer = pipeline_output.get("final_answer", "")
+
             is_correct = check_accuracy(
                 generated=generated_answer,
                 ground_truth=row["Ground_Truth_Answer"],
                 correct_letter=row["Correct_Letter"],
-                q_type=q_type
+                q_type=q_type,
             )
+
+            trace_fields = _extract_trace_fields(pipeline_output)
+
         except Exception as e:
             logging.error(f"Failed on {qid}: {e}")
             generated_answer = f"ERROR: {e}"
             is_correct = False
-            pipeline_output = {"trace": {}}
+            trace_fields = {"Retrieved_Context": ""}
 
-        results.append({
+        rec = {
             "Question_ID": qid,
             "Type": q_type,
-            "Question": row["Question"],
+            "Question": question_text,
             "Generated_Answer": generated_answer,
             "Ground_Truth_Answer": row["Ground_Truth_Answer"],
             "Is_Correct": is_correct,
-            "Veto_Triggered": pipeline_output["trace"].get("veto_triggered", False),
-        })
+        }
+        rec.update(trace_fields)
+        results.append(rec)
 
-        # Save checkpoint
         if (idx + 1) % checkpoint_every == 0:
             pd.DataFrame(results).to_csv(output_csv, index=False, encoding="utf-8-sig")
 
-    # Final save
     out_df = pd.DataFrame(results)
     out_df.to_csv(output_csv, index=False, encoding="utf-8-sig")
 
-    # Print Accuracy Report
+    # Accuracy report
     print(f"\n{'='*60}")
-    print(f"📊 BENCHMARK ACCURACY REPORT")
+    print("📊 BENCHMARK ACCURACY REPORT")
     print(f"{'='*60}")
-    for q_type in out_df["Type"].unique():
-        sub = out_df[out_df["Type"] == q_type]
-        acc = sub["Is_Correct"].mean() * 100
-        print(f"  Type {q_type} ({len(sub)} Qs): {sub['Is_Correct'].sum()}/{len(sub)} = {acc:.1f}%")
-    
+    for qt in out_df["Type"].unique():
+        sub_df = out_df[out_df["Type"] == qt]
+        acc = sub_df["Is_Correct"].mean() * 100
+        print(f"  Type {qt} ({len(sub_df)} Qs): {sub_df['Is_Correct'].sum()}/{len(sub_df)} = {acc:.1f}%")
     total_acc = out_df["Is_Correct"].mean() * 100
     print(f"  Overall Accuracy: {out_df['Is_Correct'].sum()}/{len(out_df)} = {total_acc:.1f}%")
     print(f"{'='*60}")
     print(f"✅ Report saved to: {output_csv}\n")
 
 
-def run_inference_mode(csv_path, limit):
-    """Executes the pipeline on a custom CSV, appending generated answers as new columns."""
+def run_inference_mode(csv_path: str, limit: int):
+    """Executes the pipeline on a custom CSV, appending generated answers and contexts as new columns."""
     if not os.path.exists(csv_path):
         logging.error(f"CSV file not found: {csv_path}")
         return
@@ -162,93 +302,111 @@ def run_inference_mode(csv_path, limit):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_csv = os.path.join(output_dir, f"{filename}_answered_{timestamp}.csv")
 
-    print(f"\n🚀 [INFERENCE MODE] Processing {len(df_original)} questions from custom CSV...")
-    
-    # 🌟 精准锁定问题列：优先完全匹配 "Question" 或 "Question - Reviewed"，且坚决避开 "ID"
+    print(f"\n🚀 [INFERENCE MODE] Processing {len(df_original)} rows from custom CSV...")
+
+    # Find question column (avoid ID columns)
     question_col = None
     for col in df_original.columns:
-        clean_col = col.strip().lower()
-        if clean_col == "question" or clean_col == "question - reviewed":
+        c = col.strip().lower()
+        if c in ("question", "question - reviewed"):
             question_col = col
             break
-    
-    # 兜底逻辑：如果没找到精确匹配，找包含 question 但不包含 id 的列
     if not question_col:
         for col in df_original.columns:
             if "question" in col.lower() and "id" not in col.lower():
                 question_col = col
                 break
-
     if not question_col:
         logging.error("❌ Could not find a valid 'Question' column in the CSV (avoiding 'Question ID').")
         return
 
     generated_answers = []
     retrieved_contexts = []
-    veto_flags = []
+    extracted_traces: List[Dict[str, Any]] = []
 
     checkpoint_every = 10
 
     for idx, row in tqdm(df_original.iterrows(), total=len(df_original), desc="Generating Answers"):
         question_text = str(row[question_col])
-        
-        # Default to "QA" (Open-ended) if type is not strictly defined as MC or TF
+
         q_type = str(row.get("Type", row.get("type", "QA"))).upper()
         if q_type not in ["MC", "TF"]:
             q_type = "QA"
 
+        qid = str(row.get("Question_ID", row.get("question_id", f"ROW_{idx}")))
+
         try:
-            pipeline_output = run_pipeline(question=question_text, q_type=q_type)
-            generated_answers.append(pipeline_output["final_answer"])
-            retrieved_contexts.append(pipeline_output["final_context"])
-            veto_flags.append(pipeline_output["trace"].get("veto_triggered", False))
+            pipeline_output = run_pipeline(question=question_text, q_type=q_type, question_id=qid)
+
+            generated_answers.append(pipeline_output.get("final_answer", ""))
+            retrieved_contexts.append(pipeline_output.get("final_context", ""))
+
+            extracted_traces.append(_extract_trace_fields(pipeline_output))
+
         except Exception as e:
             logging.error(f"Failed on row {idx}: {e}")
             generated_answers.append(f"ERROR: {e}")
             retrieved_contexts.append("")
-            veto_flags.append(False)
+            extracted_traces.append({"Retrieved_Context": ""})
 
-        # Save checkpoint iteratively by modifying a copy of the dataframe
         if (idx + 1) % checkpoint_every == 0:
-            df_temp = df_original.iloc[:idx+1].copy()
+            df_temp = df_original.iloc[: idx + 1].copy()
             df_temp["Generated_Answer"] = generated_answers
-            df_temp["Final_Retrieved_Context"] = retrieved_contexts
-            df_temp["Veto_Triggered"] = veto_flags
+            df_temp["Retrieved_Context"] = retrieved_contexts
+
+            # expand trace dicts into columns
+            if extracted_traces:
+                trace_df = pd.DataFrame(extracted_traces)
+                df_temp = pd.concat([df_temp.reset_index(drop=True), trace_df.reset_index(drop=True)], axis=1)
+
             df_temp.to_csv(output_csv, index=False, encoding="utf-8-sig")
 
-    # Final save
-    df_original["Generated_Answer"] = generated_answers
-    df_original["Final_Retrieved_Context"] = retrieved_contexts
-    df_original["Veto_Triggered"] = veto_flags
-    df_original.to_csv(output_csv, index=False, encoding="utf-8-sig")
+    df_out = df_original.copy()
+    df_out["Generated_Answer"] = generated_answers
+    df_out["Retrieved_Context"] = retrieved_contexts
 
-    print(f"\n✅ Processing complete! New CSV generated successfully.")
-    print(f"📁 Output saved to: {output_csv}\n")
+    if extracted_traces:
+        trace_df = pd.DataFrame(extracted_traces)
+        df_out = pd.concat([df_out.reset_index(drop=True), trace_df.reset_index(drop=True)], axis=1)
+
+    df_out.to_csv(output_csv, index=False, encoding="utf-8-sig")
+
+    print(f"\n✅ Processing complete! Output saved to: {output_csv}\n")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Run Online RAG Pipeline")
-    parser.add_argument("--subset", choices=["mc", "tf", "all"], default="all", help="JSON dataset subset to run (Benchmark Mode)")
+    parser.add_argument(
+        "--subset",
+        choices=["mc", "tf", "all"],
+        default="all",
+        help="JSON dataset subset to run (Benchmark Mode)",
+    )
+    parser.add_argument(
+        "--ids",
+        type=str,
+        default=None,
+        help="Comma-separated numeric IDs from the JSON 'ID' field to run in Benchmark Mode. "
+        "Example: --ids 6,8,13,21,29",
+    )
     parser.add_argument("--csv", type=str, default=None, help="Path to a custom CSV file (Inference Mode)")
     parser.add_argument("--limit", type=int, default=0, help="Optional limit on number of questions to process")
     args = parser.parse_args()
 
-    # =========================================================================
-    # 🌟 严格的 API Key 前置预检机制（核心亮点保护）
-    # =========================================================================
+    # Pre-flight: require keys for dual-agent voting
     openai_key = os.environ.get("OPENAI_API_KEY")
     google_key = os.environ.get("GOOGLE_API_KEY")
-    
+
     missing_keys = []
     if not openai_key:
         missing_keys.append("OPENAI_API_KEY")
     if not google_key:
         missing_keys.append("GOOGLE_API_KEY")
-        
+
     if missing_keys:
-        print("\n" + "="*70)
+        print("\n" + "=" * 70)
         print("❌ [CRITICAL ERROR] Dual-Agent Voting System Pre-flight Check Failed!")
-        print("="*70)
+        print("=" * 70)
         print("Our system relies on a dual-agent heterogeneous voting mechanism (OpenAI + Gemini)")
         print("to evaluate context sufficiency. The following required API keys are missing:")
         for key in missing_keys:
@@ -256,15 +414,14 @@ def main():
         print("\nPlease set both environment variables before starting the pipeline:")
         print("   export OPENAI_API_KEY='your_openai_key'")
         print("   export GOOGLE_API_KEY='your_google_key'")
-        print("="*70 + "\n")
+        print("=" * 70 + "\n")
         sys.exit(1)
-    # =========================================================================
 
-    # Routing logic
     if args.csv:
         run_inference_mode(args.csv, args.limit)
     else:
-        run_benchmark_mode(args.subset, args.limit)
+        run_benchmark_mode(args.subset, args.limit, args.ids)
+
 
 if __name__ == "__main__":
     main()
