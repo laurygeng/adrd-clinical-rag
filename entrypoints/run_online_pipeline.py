@@ -2,13 +2,14 @@
 """
 Online Pipeline Batch Runner (entrypoints/)
 Role:
-1) Benchmark Mode (JSONs): Evaluate ADRD MC/TF, calculate accuracy, export CSV (with full Retrieved_Context and traces).
-2) Inference Mode (CSV): Process custom CSV, append answers + contexts + traces.
+1) Benchmark Mode (JSONs): Evaluate ADRD MC/TF, calculate accuracy, export clean CSV with Retrieved_Context and timings.
+2) Inference Mode (CSV): Process custom CSV, append answers.
 """
 
 import os
 import sys
 import json
+import time
 import argparse
 import logging
 from datetime import datetime
@@ -106,42 +107,6 @@ def load_json_benchmarks(subset: str = "all", allowed_ids: Optional[Set[int]] = 
     return df
 
 
-def _extract_trace_fields(pipeline_output: dict) -> Dict[str, Any]:
-    trace = (pipeline_output or {}).get("trace", {}) if isinstance(pipeline_output, dict) else {}
-    out: Dict[str, Any] = {}
-
-    out["Retrieved_Context"] = (pipeline_output or {}).get("final_context", "")
-    out["Completion_Triggered"] = trace.get("completion_triggered", False)
-    out["Completion_Reason"] = trace.get("completion_reason", "")
-    out["Completion_Skipped_Reason"] = trace.get("completion_skipped_reason", "")
-    out["Web_Query_Used_Hop1"] = trace.get("web_query_used", "")
-    out["Web_Query_Used_Hop2"] = trace.get("web_query_used_hop2", "")
-    out["Hop2_Triggered"] = trace.get("hop2_triggered", False)
-    out["Hop2_Reason"] = trace.get("hop2_reason", "")
-    out["Court_Statement_Used"] = trace.get("court_statement_used", "")
-    out["Court_Verdict"] = trace.get("court_verdict", "N/A")
-    out["Veto_Triggered"] = trace.get("veto_triggered", False)
-
-    out["Critic_Is_Sufficient"] = trace.get("is_sufficient")
-    out["Critic_Missing_Info"] = trace.get("missing_info", "")
-    out["Critic_Decision"] = trace.get("critic_decision", "")
-    out["Critic_None_Frac_Strict"] = trace.get("critic_none_frac_strict")
-    out["Critic_Empty_Frac"] = trace.get("critic_empty_frac")
-    out["Critic_Invalid_Gap_Frac"] = trace.get("critic_invalid_gap_frac")
-    out["Critic_Consensus_Gap"] = trace.get("critic_consensus_gap", "")
-    out["Critic_Consensus_Gap_Is_Negative"] = trace.get("critic_consensus_gap_is_negative", None)
-    out["Critic_Verify_Mode"] = trace.get("critic_verify_mode", "")
-    out["Critic_Verify_Label"] = trace.get("critic_verify_label", "")
-    out["Critic_Verify_Best_Score"] = trace.get("critic_verify_best_score", None)
-    out["Critic_Verify_Threshold"] = trace.get("critic_verify_threshold", None)
-    out["Critic_Verify_Best_Span"] = trace.get("critic_verify_best_span", "")
-    out["Critic_Verify_N_Spans"] = trace.get("critic_verify_n_spans", None)
-    out["Critic_Verify_Window_Sents"] = trace.get("critic_verify_window_sents", None)
-    out["Critic_MD_Path"] = trace.get("critic_md_path", "")
-
-    return out
-
-
 def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str]):
     allowed_ids = _parse_ids(ids_str)
     df_questions = load_json_benchmarks(subset=subset, allowed_ids=allowed_ids)
@@ -171,9 +136,15 @@ def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str]):
         q_type = row["Type"]
         question_text = row["Question"]
 
+        t_start = time.time()
+        retrieved_context = ""
+        t_base, t_critic, t_comp, t_ans = None, None, None, None
+
         try:
             pipeline_output = run_pipeline(question=question_text, q_type=q_type, question_id=qid)
             generated_answer = pipeline_output.get("final_answer", "")
+            retrieved_context = pipeline_output.get("final_context", "")
+            trace_dict = pipeline_output.get("trace", {})
 
             is_correct = check_accuracy(
                 generated=generated_answer,
@@ -181,15 +152,21 @@ def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str]):
                 correct_letter=row["Correct_Letter"],
                 q_type=q_type,
             )
-
-            trace_fields = _extract_trace_fields(pipeline_output)
+            
+            # 接收内部可能透传上来的分步时间
+            t_base = trace_dict.get("time_base_retrieval")
+            t_critic = trace_dict.get("time_critic_evaluation")
+            t_comp = trace_dict.get("time_completion_retrieval")
+            t_ans = trace_dict.get("time_answer_generation")
 
         except Exception as e:
             logging.error(f"Failed on {qid}: {e}")
             generated_answer = f"ERROR: {e}"
             is_correct = False
-            trace_fields = {"Retrieved_Context": ""}
 
+        t_total = time.time() - t_start
+
+        # 核心字段 + Retrieved_Context + 耗时统计（不含冗余的调试列）
         rec = {
             "Question_ID": qid,
             "Type": q_type,
@@ -197,8 +174,14 @@ def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str]):
             "Generated_Answer": generated_answer,
             "Ground_Truth_Answer": row["Ground_Truth_Answer"],
             "Is_Correct": is_correct,
+            "Retrieved_Context": retrieved_context,
+            "Time_Total_Item": round(t_total, 2),
+            "Time_Base_Retrieval": round(t_base, 2) if t_base is not None else "",
+            "Time_Critic_Evaluation": round(t_critic, 2) if t_critic is not None else "",
+            "Time_Completion_Retrieval": round(t_comp, 2) if t_comp is not None else "",
+            "Time_Answer_Generation": round(t_ans, 2) if t_ans is not None else ""
         }
-        rec.update(trace_fields)
+        
         results.append(rec)
 
         if (idx + 1) % checkpoint_every == 0:

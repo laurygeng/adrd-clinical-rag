@@ -6,9 +6,11 @@ Key hardening:
 - All question types (TF, MC, QA) use the unified Identify-then-Verify (ItV) gap mechanism.
 - Removed legacy NLI branching.
 - Answers are delegated to the LLM (gpt-4o shim) to evaluate the final unified context.
+- Added precise step-by-step execution timers for benchmarking.
 """
 
 import os
+import time
 import logging
 import hashlib
 from typing import Dict, Any, List, Union
@@ -159,16 +161,18 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "") -> Di
 
         "completion_triggered": False,
         "completion_reason": "",
-        "completion_skipped_reason": "",
         "web_query_used": "",
-        "court_statement_used": "",
-        "court_verdict": "",
-        "court_flags": {},
-        "veto_triggered": False,
+
+        # 耗时统计初始化
+        "time_base_retrieval": 0.0,
+        "time_critic_evaluation": 0.0,
+        "time_completion_retrieval": 0.0,
+        "time_answer_generation": 0.0,
     }
 
-    # STEP 1: Base Retrieval
+    # STEP 1: Base Retrieval (计时)
     logging.info("Step 1: Running Base Retrieval...")
+    t0 = time.time()
     base_passages, _, _ = retriever.get_retrieved_passages(
         question,
         top_k=8,
@@ -176,9 +180,11 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "") -> Di
         vector_weight=0.7,
     )
     base_context = "\n\n".join(base_passages)
+    trace_log["time_base_retrieval"] = time.time() - t0
 
-    # STEP 2: Critic (Unified)
+    # STEP 2: Critic (Unified) (计时)
     logging.info("Step 2: Critic Agent evaluating sufficiency...")
+    t0 = time.time()
     is_sufficient, missing_info, critic_trace = evaluate_sufficiency(
         question=question,
         context=base_context,
@@ -187,6 +193,7 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "") -> Di
         question_id=question_id,
         retriever=retriever,
     )
+    trace_log["time_critic_evaluation"] = time.time() - t0
 
     trace_log["is_sufficient"] = is_sufficient
     trace_log["missing_info"] = (missing_info or "").strip()
@@ -210,7 +217,7 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "") -> Di
         trace_log["critic_verify_window_sents"] = critic_trace.get("verify_window_sents")
         trace_log["critic_md_path"] = critic_trace.get("md_path", "")
 
-    # STEP 3-5: Unified Completion Routing
+    # STEP 3-5: Unified Completion Routing (计时)
     final_context = base_context
     critic_verify_label = (trace_log.get("critic_verify_label") or "").strip().upper()
     consensus_gap_is_negative = bool(trace_log.get("critic_consensus_gap_is_negative"))
@@ -218,6 +225,7 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "") -> Di
     should_complete = (not is_sufficient) and (critic_verify_label == "ABSENT") and (not consensus_gap_is_negative)
     
     if should_complete:
+        t0 = time.time()
         trace_log["completion_triggered"] = True
         trace_log["completion_reason"] = "critic_insufficient_and_absent"
 
@@ -245,17 +253,12 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "") -> Di
             trace_log["web_query_used"] = ""
 
         merged_passages = deduplicate_passages(base_passages + gap_passages + web_passages)
-        merged_context = "\n\n".join(merged_passages[:15])
+        final_context = "\n\n".join(merged_passages[:15])
+        trace_log["time_completion_retrieval"] = time.time() - t0
 
-        logging.info("Step 5: Court auditing BYPASSED.")
-        trace_log["court_statement_used"] = (trace_log.get("missing_info") or "").strip() or question
-        trace_log["court_verdict"] = "BYPASSED"
-        trace_log["court_flags"] = {}
-        trace_log["veto_triggered"] = False
-        final_context = merged_context
-
-    # STEP 6: Final Answer (Unified Delegation to LLM)
+    # STEP 6: Final Answer (Unified Delegation to LLM) (计时)
     logging.info("Step 6: Answer Agent generating final output...")
+    t0 = time.time()
     final_answer = generate_final_answer(
         client=client,
         question=question,
@@ -263,6 +266,7 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "") -> Di
         q_type=q_type,
         model_name="gpt-4o",
     )
+    trace_log["time_answer_generation"] = time.time() - t0
 
     try:
         write_jsonl(
