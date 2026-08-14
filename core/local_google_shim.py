@@ -16,7 +16,7 @@ def _get_hulumed_pipeline():
         device_map = os.environ.get("HF_DEVICE_MAP", "auto")
         dtype = torch.float16 if torch.cuda.is_available() else torch.float32
         
-        # 核心拦截：只保留标准模型参数，绝对不让任何多余的键引起报错
+        # Core interception: keep standard model kwargs and enforce offline mode
         model_kwargs = {"torch_dtype": dtype}
 
         try:
@@ -27,9 +27,10 @@ def _get_hulumed_pipeline():
                 trust_remote_code=True,
                 model_kwargs=model_kwargs,
                 device_map=device_map,
+                local_files_only=True,
             )
         except TypeError as e:
-            # 容错兜底：如果还报未使用的参数错误，自动剥离并重试
+            # Fallback handling for unused keyword arguments
             print(f"[Shim Warning] Caught pipeline init error ({e}), retrying with minimal kwargs...")
             if "model_kwargs" in str(e) or "not used" in str(e):
                 _hulumed_pipeline = pipeline(
@@ -38,6 +39,7 @@ def _get_hulumed_pipeline():
                     cache_dir=cache_dir,
                     trust_remote_code=True,
                     device_map=device_map,
+                    local_files_only=True,
                 )
             else:
                 raise e
@@ -61,7 +63,7 @@ class _Models:
             except Exception:
                 pass
 
-        # 过滤掉可能引起警告的 generation 参数混合，保证百分之百安全
+        # Filter generation parameters to ensure safety
         gen_kwargs = {"max_new_tokens": max_tokens, "do_sample": temp > 0.0}
         if temp > 0.0:
             gen_kwargs["temperature"] = float(temp)
@@ -69,7 +71,7 @@ class _Models:
         try:
             outputs = pipe(prompt, **gen_kwargs, return_full_text=False)
         except Exception:
-            # 如果带参数失败，降级用最简单的无参生成
+            # Fallback generation without generation args on error
             outputs = pipe(prompt, max_new_tokens=max_tokens, return_full_text=False)
 
         generated_text = outputs[0].get("generated_text") if isinstance(outputs[0], dict) else str(outputs[0])

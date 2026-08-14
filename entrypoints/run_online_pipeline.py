@@ -2,7 +2,7 @@
 """
 Online Pipeline Batch Runner (entrypoints/)
 Role:
-1) Benchmark Mode (JSONs): Evaluate ADRD MC/TF, calculate accuracy, export clean CSV with Retrieved_Context and timings.
+1) Benchmark Mode (JSONs): Evaluate ADRD MC/TF, calculate accuracy, export clean CSV with Retrieved_Context and timings. (Resumable)
 2) Inference Mode (CSV): Process custom CSV, append answers.
 """
 
@@ -119,76 +119,102 @@ def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str]):
 
     output_dir = os.path.join(PROJECT_ROOT, "evaluation_results")
     os.makedirs(output_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    ids_tag = ""
-    if allowed_ids is not None:
-        ids_sorted = ",".join(str(x) for x in sorted(allowed_ids))
-        ids_tag = f"_ids_{ids_sorted.replace(',', '-')}"
-    output_csv = os.path.join(output_dir, f"benchmark_eval_{subset}_{timestamp}{ids_tag}.csv")
 
-    print(f"\n🚀 [BENCHMARK MODE] Evaluating {len(df_questions)} questions...")
-
+    # 检查是否已有同类型的未完成结果文件，支持断点续做
+    existing_files = [f for f in os.listdir(output_dir) if f.startswith(f"benchmark_eval_{subset}_") and f.endswith(".csv")]
+    
     results = []
-    checkpoint_every = 10
-
-    for idx, row in tqdm(df_questions.iterrows(), total=len(df_questions), desc="Running Benchmarks"):
-        qid = row["Question_ID"]
-        q_type = row["Type"]
-        question_text = row["Question"]
-
-        t_start = time.time()
-        retrieved_context = ""
-        t_base, t_critic, t_comp, t_ans = None, None, None, None
-
+    processed_ids = set()
+    
+    if existing_files:
+        # 找到最近生成的一个文件作为续做目标
+        existing_files.sort()
+        output_csv = os.path.join(output_dir, existing_files[-1])
+        print(f"\n🔄 [RESUME MODE] Found existing report: {output_csv}")
         try:
-            pipeline_output = run_pipeline(question=question_text, q_type=q_type, question_id=qid)
-            generated_answer = pipeline_output.get("final_answer", "")
-            retrieved_context = pipeline_output.get("final_context", "")
-            trace_dict = pipeline_output.get("trace", {})
-
-            is_correct = check_accuracy(
-                generated=generated_answer,
-                ground_truth=row["Ground_Truth_Answer"],
-                correct_letter=row["Correct_Letter"],
-                q_type=q_type,
-            )
-            
-            # 接收内部可能透传上来的分步时间
-            t_base = trace_dict.get("time_base_retrieval")
-            t_critic = trace_dict.get("time_critic_evaluation")
-            t_comp = trace_dict.get("time_completion_retrieval")
-            t_ans = trace_dict.get("time_answer_generation")
-
+            existing_df = pd.read_csv(output_csv)
+            if "Question_ID" in existing_df.columns:
+                processed_ids = set(existing_df["Question_ID"].astype(str).tolist())
+                results = existing_df.to_dict(orient="records")
+                print(f"   Already processed {len(processed_ids)} questions. Resuming...")
         except Exception as e:
-            logging.error(f"Failed on {qid}: {e}")
-            generated_answer = f"ERROR: {e}"
-            is_correct = False
+            logging.warning(f"Could not load existing CSV for resume: {e}")
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ids_tag = ""
+        if allowed_ids is not None:
+            ids_sorted = ",".join(str(x) for x in sorted(allowed_ids))
+            ids_tag = f"_ids_{ids_sorted.replace(',', '-')}"
+        output_csv = os.path.join(output_dir, f"benchmark_eval_{subset}_{timestamp}{ids_tag}.csv")
 
-        t_total = time.time() - t_start
+    # 过滤掉已经跑过的题目
+    remaining_df = df_questions[~df_questions["Question_ID"].astype(str).isin(processed_ids)].reset_index(drop=True)
 
-        # 核心字段 + Retrieved_Context + 耗时统计（不含冗余的调试列）
-        rec = {
-            "Question_ID": qid,
-            "Type": q_type,
-            "Question": question_text,
-            "Generated_Answer": generated_answer,
-            "Ground_Truth_Answer": row["Ground_Truth_Answer"],
-            "Is_Correct": is_correct,
-            "Retrieved_Context": retrieved_context,
-            "Time_Total_Item": round(t_total, 2),
-            "Time_Base_Retrieval": round(t_base, 2) if t_base is not None else "",
-            "Time_Critic_Evaluation": round(t_critic, 2) if t_critic is not None else "",
-            "Time_Completion_Retrieval": round(t_comp, 2) if t_comp is not None else "",
-            "Time_Answer_Generation": round(t_ans, 2) if t_ans is not None else ""
-        }
-        
-        results.append(rec)
+    if remaining_df.empty:
+        print("\n✅ All selected questions have already been processed in the latest CSV!")
+        out_df = pd.DataFrame(results)
+    else:
+        print(f"\n🚀 [BENCHMARK MODE] Evaluating {len(remaining_df)} remaining questions (Sequential & Safe)...")
+        checkpoint_every = 5
 
-        if (idx + 1) % checkpoint_every == 0:
-            pd.DataFrame(results).to_csv(output_csv, index=False, encoding="utf-8-sig")
+        for idx, row in tqdm(remaining_df.iterrows(), total=len(remaining_df), desc="Running Benchmarks"):
+            qid = row["Question_ID"]
+            q_type = row["Type"]
+            question_text = row["Question"]
 
-    out_df = pd.DataFrame(results)
-    out_df.to_csv(output_csv, index=False, encoding="utf-8-sig")
+            t_start = time.time()
+            retrieved_context = ""
+            t_base, t_critic, t_comp, t_ans = None, None, None, None
+
+            try:
+                pipeline_output = run_pipeline(question=question_text, q_type=q_type, question_id=qid)
+                generated_answer = pipeline_output.get("final_answer", "")
+                retrieved_context = pipeline_output.get("final_context", "")
+                trace_dict = pipeline_output.get("trace", {})
+
+                is_correct = check_accuracy(
+                    generated=generated_answer,
+                    ground_truth=row["Ground_Truth_Answer"],
+                    correct_letter=row["Correct_Letter"],
+                    q_type=q_type,
+                )
+                
+                t_base = trace_dict.get("time_base_retrieval")
+                t_critic = trace_dict.get("time_critic_evaluation")
+                t_comp = trace_dict.get("time_completion_retrieval")
+                t_ans = trace_dict.get("time_answer_generation")
+
+            except Exception as e:
+                logging.error(f"Failed on {qid}: {e}")
+                generated_answer = f"ERROR: {e}"
+                is_correct = False
+                retrieved_context = f"ERROR: {e}"
+
+            t_total = time.time() - t_start
+
+            rec = {
+                "Question_ID": qid,
+                "Type": q_type,
+                "Question": question_text,
+                "Generated_Answer": generated_answer,
+                "Ground_Truth_Answer": row["Ground_Truth_Answer"],
+                "Is_Correct": is_correct,
+                "Retrieved_Context": retrieved_context,
+                "Time_Total_Item": round(t_total, 2),
+                "Time_Base_Retrieval": round(t_base, 2) if t_base is not None else "",
+                "Time_Critic_Evaluation": round(t_critic, 2) if t_critic is not None else "",
+                "Time_Completion_Retrieval": round(t_comp, 2) if t_comp is not None else "",
+                "Time_Answer_Generation": round(t_ans, 2) if t_ans is not None else ""
+            }
+            
+            results.append(rec)
+
+            # 定期保存检查点
+            if (idx + 1) % checkpoint_every == 0:
+                pd.DataFrame(results).to_csv(output_csv, index=False, encoding="utf-8-sig")
+
+        out_df = pd.DataFrame(results)
+        out_df.to_csv(output_csv, index=False, encoding="utf-8-sig")
 
     print(f"\n{'='*60}")
     print("📊 BENCHMARK ACCURACY REPORT")

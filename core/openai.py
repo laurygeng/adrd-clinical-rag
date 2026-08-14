@@ -18,7 +18,7 @@ def _get_pipeline():
         dtype = torch.float16 if torch.cuda.is_available() else torch.float32
         model_kwargs = {"torch_dtype": dtype}
 
-        # 彻底移除 cache_dir 显式传参，避免任何底层兼容报错
+        # Completely remove explicit cache_dir and local_files_only to prevent keyword argument mismatch errors
         _llama_pipeline = pipeline(
             "text-generation",
             model=model_id,
