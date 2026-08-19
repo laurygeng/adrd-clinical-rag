@@ -3,7 +3,7 @@
 Online Pipeline Batch Runner (entrypoints/)
 Role:
 1) Benchmark Mode (JSONs): Evaluate ADRD MC/TF, calculate accuracy, export clean CSV with Retrieved_Context and timings. (Resumable)
-2) Inference Mode (CSV): Process custom CSV, append answers.
+2) Inference Mode (CSV): Process custom CSV, append answers. (Resumable)
 """
 
 import os
@@ -229,6 +229,115 @@ def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str]):
     print(f"✅ Report saved to: {output_csv}\n")
 
 
+def run_inference_mode(csv_path: str, limit: int):
+    if not os.path.exists(csv_path):
+        logging.error(f"Input CSV not found: {csv_path}")
+        return
+
+    try:
+        df_questions = pd.read_csv(csv_path)
+    except Exception as e:
+        logging.error(f"Failed to read CSV {csv_path}: {e}")
+        return
+
+    if df_questions.empty:
+        logging.error("The provided CSV is empty.")
+        return
+
+    # 确保有一个唯一 ID 用于追踪断点
+    if "Question_ID" not in df_questions.columns:
+        df_questions["Question_ID"] = [f"Custom_Q_{i:04d}" for i in range(len(df_questions))]
+
+    if limit > 0:
+        df_questions = df_questions.head(limit)
+
+    output_dir = os.path.join(PROJECT_ROOT, "evaluation_results")
+    os.makedirs(output_dir, exist_ok=True)
+
+    base_name = os.path.splitext(os.path.basename(csv_path))[0]
+    output_csv = os.path.join(output_dir, f"{base_name}_results.csv")
+
+    results = []
+    processed_ids = set()
+
+    # 检查是否已有输出文件，支持断点续做
+    if os.path.exists(output_csv):
+        print(f"\n🔄 [RESUME MODE] Found existing output CSV: {output_csv}")
+        try:
+            existing_df = pd.read_csv(output_csv)
+            if "Question_ID" in existing_df.columns:
+                processed_ids = set(existing_df["Question_ID"].astype(str).tolist())
+                results = existing_df.to_dict(orient="records")
+                print(f"   Already processed {len(processed_ids)} questions. Resuming...")
+        except Exception as e:
+            logging.warning(f"Could not load existing CSV for resume: {e}")
+
+    # 过滤掉已经跑过的题目
+    remaining_df = df_questions[~df_questions["Question_ID"].astype(str).isin(processed_ids)].reset_index(drop=True)
+
+    if remaining_df.empty:
+        print(f"\n✅ All questions in {csv_path} have already been processed!")
+        return
+
+    print(f"\n🚀 [INFERENCE MODE] Evaluating {len(remaining_df)} remaining questions from CSV (Sequential & Safe)...")
+    checkpoint_every = 5
+
+    for idx, row in tqdm(remaining_df.iterrows(), total=len(remaining_df), desc="Running Inference"):
+        qid = row["Question_ID"]
+        
+        # 兼容不同的列名大小写
+        question_text = row.get("Question", row.get("question", ""))
+        q_type = row.get("Type", row.get("type", "QA")) # 默认类型为 QA
+
+        if not question_text or pd.isna(question_text):
+            logging.warning(f"Row {qid} missing 'Question' text. Skipping.")
+            continue
+
+        t_start = time.time()
+        retrieved_context = ""
+        t_base, t_critic, t_comp, t_ans = None, None, None, None
+
+        try:
+            pipeline_output = run_pipeline(question=question_text, q_type=q_type, question_id=qid)
+            generated_answer = pipeline_output.get("final_answer", "")
+            retrieved_context = pipeline_output.get("final_context", "")
+            trace_dict = pipeline_output.get("trace", {})
+
+            t_base = trace_dict.get("time_base_retrieval")
+            t_critic = trace_dict.get("time_critic_evaluation")
+            t_comp = trace_dict.get("time_completion_retrieval")
+            t_ans = trace_dict.get("time_answer_generation")
+
+        except Exception as e:
+            logging.error(f"Failed on {qid}: {e}")
+            generated_answer = f"ERROR: {e}"
+            retrieved_context = f"ERROR: {e}"
+
+        t_total = time.time() - t_start
+
+        # 保留原 CSV 中的所有列，并追加 pipeline 的结果
+        rec = row.to_dict()
+        rec.update({
+            "Generated_Answer": generated_answer,
+            "Retrieved_Context": retrieved_context,
+            "Time_Total_Item": round(t_total, 2),
+            "Time_Base_Retrieval": round(t_base, 2) if t_base is not None else "",
+            "Time_Critic_Evaluation": round(t_critic, 2) if t_critic is not None else "",
+            "Time_Completion_Retrieval": round(t_comp, 2) if t_comp is not None else "",
+            "Time_Answer_Generation": round(t_ans, 2) if t_ans is not None else ""
+        })
+        
+        results.append(rec)
+
+        # 定期保存检查点
+        if (idx + 1) % checkpoint_every == 0:
+            pd.DataFrame(results).to_csv(output_csv, index=False, encoding="utf-8-sig")
+
+    # 循环结束后最后保存一次
+    pd.DataFrame(results).to_csv(output_csv, index=False, encoding="utf-8-sig")
+    print(f"\n✅ Inference complete. Report saved to: {output_csv}\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run Online RAG Pipeline")
     parser.add_argument(
@@ -265,7 +374,11 @@ def main():
         print("\nPlease set both environment variables before starting.")
         sys.exit(1)
 
-    run_benchmark_mode(args.subset, args.limit, args.ids)
+    # 核心改动：根据是否传入了 --csv 分支进入不同的执行模式
+    if args.csv:
+        run_inference_mode(args.csv, args.limit)
+    else:
+        run_benchmark_mode(args.subset, args.limit, args.ids)
 
 
 if __name__ == "__main__":
