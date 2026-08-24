@@ -7,6 +7,9 @@ Key hardening:
 - Removed legacy NLI branching.
 - Answers are delegated to the LLM (gpt-4o shim) to evaluate the final unified context.
 - Added precise step-by-step execution timers for benchmarking.
+
+** ABLATION SUPPORT ADDED **
+- Added parameters to selectively disable Base RAG and/or Completion Retrieval.
 """
 
 import os
@@ -127,8 +130,9 @@ def generate_web_rewrite_query(statement: str, gap_hint: str = "") -> str:
         return f"{s}\n\nSearch query focus: {gh}".strip()
 
 
-def run_pipeline(question: str, q_type: str = "MC", question_id: str = "") -> Dict[str, Any]:
-    retriever = get_retriever()
+def run_pipeline(question: str, q_type: str = "MC", question_id: str = "", use_rag: bool = True, use_completion: bool = True) -> Dict[str, Any]:
+    # Only initialize Retriever if RAG is used to save memory
+    retriever = get_retriever() if (use_rag or use_completion) else None
     client = get_oai_client()
 
     run_dir = get_run_dir()
@@ -163,81 +167,99 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "") -> Di
         "completion_reason": "",
         "web_query_used": "",
 
-        # 耗时统计初始化
+        # Execution timers
         "time_base_retrieval": 0.0,
         "time_critic_evaluation": 0.0,
         "time_completion_retrieval": 0.0,
         "time_answer_generation": 0.0,
     }
 
-    # STEP 1: Base Retrieval (计时)
-    logging.info("Step 1: Running Base Retrieval...")
+    # STEP 1: Base Retrieval (Time tracking and ablation control)
     t0 = time.time()
-    base_passages, _, _ = retriever.get_retrieved_passages(
-        question,
-        top_k=8,
-        bm25_weight=0.3,
-        vector_weight=0.7,
-    )
-    base_context = "\n\n".join(base_passages)
+    if use_rag:
+        logging.info("Step 1: Running Base Retrieval...")
+        # Kept at 8 to preserve the integrity of the baseline ablation tests
+        base_passages, _, _ = retriever.get_retrieved_passages(
+            question,
+            top_k=8,
+            bm25_weight=0.3,
+            vector_weight=0.7,
+        )
+        base_context = "\n\n".join(base_passages)
+    else:
+        logging.info("Step 1: SKIPPED (Ablation: No RAG)")
+        base_passages = []
+        base_context = ""
     trace_log["time_base_retrieval"] = time.time() - t0
 
-    # STEP 2: Critic (Unified) (计时)
-    logging.info("Step 2: Critic Agent evaluating sufficiency...")
+    # STEP 2: Critic (Unified) (Time tracking and ablation control)
     t0 = time.time()
-    is_sufficient, missing_info, critic_trace = evaluate_sufficiency(
-        question=question,
-        context=base_context,
-        q_type=q_type,
-        calls_per_agent=5,
-        question_id=question_id,
-        retriever=retriever,
-    )
+    if use_completion:
+        logging.info("Step 2: Critic Agent evaluating sufficiency...")
+        is_sufficient, missing_info, critic_trace = evaluate_sufficiency(
+            question=question,
+            context=base_context,
+            q_type=q_type,
+            calls_per_agent=5,
+            question_id=question_id,
+            retriever=retriever,
+        )
+        
+        trace_log["is_sufficient"] = is_sufficient
+        trace_log["missing_info"] = (missing_info or "").strip()
+
+        if isinstance(critic_trace, dict):
+            consensus_debug = critic_trace.get("consensus_debug", {}) or {}
+            trace_log["critic_decision"] = consensus_debug.get("decision", "")
+
+            trace_log["critic_none_frac_strict"] = critic_trace.get("none_frac_strict")
+            trace_log["critic_empty_frac"] = critic_trace.get("empty_frac")
+            trace_log["critic_invalid_gap_frac"] = critic_trace.get("invalid_gap_frac")
+            trace_log["critic_consensus_gap"] = critic_trace.get("consensus_gap", "")
+            trace_log["critic_consensus_gap_is_negative"] = critic_trace.get("consensus_gap_is_negative")
+
+            trace_log["critic_verify_mode"] = critic_trace.get("verify_mode", "")
+            trace_log["critic_verify_label"] = critic_trace.get("verify_label", "")
+            trace_log["critic_verify_best_score"] = critic_trace.get("verify_best_score")
+            trace_log["critic_verify_threshold"] = critic_trace.get("verify_threshold")
+            trace_log["critic_verify_best_span"] = critic_trace.get("verify_best_span", "")
+            trace_log["critic_verify_n_spans"] = critic_trace.get("verify_n_spans")
+            trace_log["critic_verify_window_sents"] = critic_trace.get("verify_window_sents")
+            trace_log["critic_md_path"] = critic_trace.get("md_path", "")
+    else:
+        logging.info("Step 2: SKIPPED (Ablation: No Completion/Critic)")
+        is_sufficient = True
+        trace_log["is_sufficient"] = True
     trace_log["time_critic_evaluation"] = time.time() - t0
 
-    trace_log["is_sufficient"] = is_sufficient
-    trace_log["missing_info"] = (missing_info or "").strip()
-
-    if isinstance(critic_trace, dict):
-        consensus_debug = critic_trace.get("consensus_debug", {}) or {}
-        trace_log["critic_decision"] = consensus_debug.get("decision", "")
-
-        trace_log["critic_none_frac_strict"] = critic_trace.get("none_frac_strict")
-        trace_log["critic_empty_frac"] = critic_trace.get("empty_frac")
-        trace_log["critic_invalid_gap_frac"] = critic_trace.get("invalid_gap_frac")
-        trace_log["critic_consensus_gap"] = critic_trace.get("consensus_gap", "")
-        trace_log["critic_consensus_gap_is_negative"] = critic_trace.get("consensus_gap_is_negative")
-
-        trace_log["critic_verify_mode"] = critic_trace.get("verify_mode", "")
-        trace_log["critic_verify_label"] = critic_trace.get("verify_label", "")
-        trace_log["critic_verify_best_score"] = critic_trace.get("verify_best_score")
-        trace_log["critic_verify_threshold"] = critic_trace.get("verify_threshold")
-        trace_log["critic_verify_best_span"] = critic_trace.get("verify_best_span", "")
-        trace_log["critic_verify_n_spans"] = critic_trace.get("verify_n_spans")
-        trace_log["critic_verify_window_sents"] = critic_trace.get("verify_window_sents")
-        trace_log["critic_md_path"] = critic_trace.get("md_path", "")
-
-    # STEP 3-5: Unified Completion Routing (计时)
+    # STEP 3-5: Unified Completion Routing (Time tracking and ablation control)
     final_context = base_context
     critic_verify_label = (trace_log.get("critic_verify_label") or "").strip().upper()
     consensus_gap_is_negative = bool(trace_log.get("critic_consensus_gap_is_negative"))
 
-    should_complete = (not is_sufficient) and (critic_verify_label == "ABSENT") and (not consensus_gap_is_negative)
+    # Only trigger completion if completion is enabled and critic deemed it necessary
+    should_complete = use_completion and (not is_sufficient) and (critic_verify_label == "ABSENT") and (not consensus_gap_is_negative)
     
+    t0 = time.time()
     if should_complete:
-        t0 = time.time()
         trace_log["completion_triggered"] = True
         trace_log["completion_reason"] = "critic_insufficient_and_absent"
 
         logging.info("Step 3: Triggering Completion Retrieval...")
         completion_query = generate_web_rewrite_query(statement=question, gap_hint=trace_log.get('missing_info',''))
         
+        # [Completion-Specific Limit]: Only retrieve top 2 gap passages to reduce semantic dilution
         gap_passages, _, _ = retriever.get_retrieved_passages(
             completion_query,
-            top_k=5,
+            top_k=2,
             bm25_weight=0.5,
             vector_weight=0.5,
         )
+        
+        # [Tagging & Isolation]: Tag sources only during completion merging to preserve base ablation integrity
+        gap_tagged = [f"[GAP] {p}" for p in gap_passages]
+        # Compress base passages to top 5 to make safe room for external knowledge
+        base_tagged = [f"[BASE] {p}" for p in base_passages[:5]]
 
         web_passages: List[str] = []
         try:
@@ -252,11 +274,28 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "") -> Di
             logging.warning(f"Web retrieval failed: {e}. Proceeding with local gap passages only.")
             trace_log["web_query_used"] = ""
 
-        merged_passages = deduplicate_passages(base_passages + gap_passages + web_passages)
-        final_context = "\n\n".join(merged_passages[:15])
-        trace_log["time_completion_retrieval"] = time.time() - t0
+        # Prioritize tagged passages: Base(5) -> Gap(2) -> Web(2)
+        prioritized_passages = base_tagged + gap_tagged + web_passages[:2]
+        merged_passages = deduplicate_passages(prioritized_passages)
+        
+        # [Double Circuit Breaker]: Hard limit on noise to prevent context overload
+        MAX_CONTEXT_CHARS = 12000
+        current_chars = 0
+        final_passages = []
+        
+        for p in merged_passages[:8]:
+            if current_chars + len(p) > MAX_CONTEXT_CHARS and len(final_passages) >= 4:
+                break
+            final_passages.append(p)
+            current_chars += len(p)
+            
+        final_context = "\n\n".join(final_passages)
+    else:
+        if not use_completion:
+            logging.info("Step 3-5: SKIPPED (Ablation: No Completion Retrieval)")
+    trace_log["time_completion_retrieval"] = time.time() - t0
 
-    # STEP 6: Final Answer (Unified Delegation to LLM) (计时)
+    # STEP 6: Final Answer (Unified Delegation to LLM) (Time tracking)
     logging.info("Step 6: Answer Agent generating final output...")
     t0 = time.time()
     final_answer = generate_final_answer(

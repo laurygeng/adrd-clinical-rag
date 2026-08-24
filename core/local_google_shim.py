@@ -1,8 +1,9 @@
 # core/local_google_shim.py
 import os
+import gc
 import torch
 from types import SimpleNamespace
-from transformers import pipeline
+from transformers import pipeline, BitsAndBytesConfig
 
 _hulumed_pipeline = None
 
@@ -11,13 +12,22 @@ def _get_hulumed_pipeline():
     if _hulumed_pipeline is None:
         model_id = os.environ.get("LOCAL_AGENT_B_MODEL", "ZJU-AI4H/Hulu-Med-7B")
         cache_dir = os.environ.get("HF_HOME", "/users/minjieg/code/scripts/models")
-        print(f"\n[Shim] Loading local model for Google GenAI API: {model_id}...")
         
         device_map = os.environ.get("HF_DEVICE_MAP", "auto")
         dtype = torch.float16 if torch.cuda.is_available() else torch.float32
         
-        # Core interception: keep standard model kwargs and enforce offline mode
         model_kwargs = {"torch_dtype": dtype}
+        
+        # 真正激活 4-bit 压缩配置
+        if os.environ.get("HF_USE_4BIT") == "1":
+            model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=dtype,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4"
+            )
+            
+        print(f"\n[Shim] Loading local model for Google GenAI API: {model_id} (4-bit: {os.environ.get('HF_USE_4BIT') == '1'})...")
 
         try:
             _hulumed_pipeline = pipeline(
@@ -30,7 +40,6 @@ def _get_hulumed_pipeline():
                 local_files_only=True,
             )
         except TypeError as e:
-            # Fallback handling for unused keyword arguments
             print(f"[Shim Warning] Caught pipeline init error ({e}), retrying with minimal kwargs...")
             if "model_kwargs" in str(e) or "not used" in str(e):
                 _hulumed_pipeline = pipeline(
@@ -63,7 +72,6 @@ class _Models:
             except Exception:
                 pass
 
-        # Filter generation parameters to ensure safety
         gen_kwargs = {"max_new_tokens": max_tokens, "do_sample": temp > 0.0}
         if temp > 0.0:
             gen_kwargs["temperature"] = float(temp)
@@ -71,8 +79,11 @@ class _Models:
         try:
             outputs = pipe(prompt, **gen_kwargs, return_full_text=False)
         except Exception:
-            # Fallback generation without generation args on error
             outputs = pipe(prompt, max_new_tokens=max_tokens, return_full_text=False)
+        finally:
+            # 强制清空 GPU KV Cache 垃圾
+            torch.cuda.empty_cache()
+            gc.collect()
 
         generated_text = outputs[0].get("generated_text") if isinstance(outputs[0], dict) else str(outputs[0])
         if isinstance(generated_text, str):

@@ -158,10 +158,11 @@ def generate_final_answer(client, question: str, context: str, q_type: str, mode
     target_max_tokens = 10
 
     if q_type == "TF":
+        # [Modified] Tightened the decision rule to strictly prevent model hallucination or over-inference.
         strict_instruction += (
             "2. FORMAT: Output ONLY the final answer, with no explanation, preamble, or extra text.\n"
-            "3. DECISION RULE: Answer 'Yes' if the context states OR implies the statement; "
-            "answer 'No' if the context contradicts it or contains no related information.\n"
+            "3. DECISION RULE: Answer 'Yes' ONLY IF the context explicitly and directly confirms the statement. "
+            "Answer 'No' if the context contradicts it, lacks direct confirmation, or is ambiguous. Do not infer.\n"
             "4. Your output must be EXACTLY 'Yes' or 'No'."
         )
     elif q_type == "MC":
