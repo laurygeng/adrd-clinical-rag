@@ -4,6 +4,9 @@ Online Pipeline Batch Runner (entrypoints/)
 Role:
 1) Benchmark Mode (JSONs): Evaluate ADRD MC/TF, calculate accuracy, export clean CSV with Retrieved_Context and timings. (Resumable)
 2) Inference Mode (CSV): Process custom CSV, append answers. (Resumable)
+
+** ABLATION SUPPORT ADDED **
+Supports --no-rag and --no-completion flags.
 """
 
 import os
@@ -66,16 +69,14 @@ def load_json_benchmarks(subset: str = "all", allowed_ids: Optional[Set[int]] = 
             options_str = "\n".join([f"  {k}. {v}" for k, v in options.items()])
             formatted_q = f"{q_text}\n\nOptions:\n{options_str}\n"
 
-            records.append(
-                {
-                    "Question_ID": q_id,
-                    "Type": "MC",
-                    "Question": formatted_q,
-                    "Ground_Truth_Answer": ground_truth_text,
-                    "Correct_Letter": ans_letter,
-                    "Numeric_ID": q_num,
-                }
-            )
+            records.append({
+                "Question_ID": q_id,
+                "Type": "MC",
+                "Question": formatted_q,
+                "Ground_Truth_Answer": ground_truth_text,
+                "Correct_Letter": ans_letter,
+                "Numeric_ID": q_num,
+            })
 
     if subset in ("tf", "all") and os.path.exists(tf_path):
         with open(tf_path, encoding="utf-8") as f:
@@ -90,16 +91,14 @@ def load_json_benchmarks(subset: str = "all", allowed_ids: Optional[Set[int]] = 
             ground_truth = item["Answer"]
             formatted_q = f"True or False statement: {q_text}\n"
 
-            records.append(
-                {
-                    "Question_ID": q_id,
-                    "Type": "TF",
-                    "Question": formatted_q,
-                    "Ground_Truth_Answer": ground_truth,
-                    "Correct_Letter": ground_truth,
-                    "Numeric_ID": q_num,
-                }
-            )
+            records.append({
+                "Question_ID": q_id,
+                "Type": "TF",
+                "Question": formatted_q,
+                "Ground_Truth_Answer": ground_truth,
+                "Correct_Letter": ground_truth,
+                "Numeric_ID": q_num,
+            })
 
     df = pd.DataFrame(records)
     if not df.empty and "Numeric_ID" in df.columns:
@@ -107,7 +106,7 @@ def load_json_benchmarks(subset: str = "all", allowed_ids: Optional[Set[int]] = 
     return df
 
 
-def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str]):
+def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str], use_rag: bool, use_completion: bool):
     allowed_ids = _parse_ids(ids_str)
     df_questions = load_json_benchmarks(subset=subset, allowed_ids=allowed_ids)
     if df_questions.empty:
@@ -120,14 +119,20 @@ def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str]):
     output_dir = os.path.join(PROJECT_ROOT, "evaluation_results")
     os.makedirs(output_dir, exist_ok=True)
 
-    # 检查是否已有同类型的未完成结果文件，支持断点续做
-    existing_files = [f for f in os.listdir(output_dir) if f.startswith(f"benchmark_eval_{subset}_") and f.endswith(".csv")]
+    # 动态生成消融实验的文件标签
+    ablation_tag = ""
+    if not use_rag:
+        ablation_tag += "_NO_RAG"
+    if not use_completion:
+        ablation_tag += "_NO_COMPLETION"
+
+    prefix = f"benchmark_eval_{subset}{ablation_tag}_"
+    existing_files = [f for f in os.listdir(output_dir) if f.startswith(prefix) and f.endswith(".csv")]
     
     results = []
     processed_ids = set()
     
     if existing_files:
-        # 找到最近生成的一个文件作为续做目标
         existing_files.sort()
         output_csv = os.path.join(output_dir, existing_files[-1])
         print(f"\n🔄 [RESUME MODE] Found existing report: {output_csv}")
@@ -139,15 +144,14 @@ def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str]):
                 print(f"   Already processed {len(processed_ids)} questions. Resuming...")
         except Exception as e:
             logging.warning(f"Could not load existing CSV for resume: {e}")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            ids_tag = "" if allowed_ids is None else f"_ids_{','.join(str(x) for x in sorted(allowed_ids)).replace(',', '-')}"
+            output_csv = os.path.join(output_dir, f"{prefix}{timestamp}{ids_tag}.csv")
     else:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        ids_tag = ""
-        if allowed_ids is not None:
-            ids_sorted = ",".join(str(x) for x in sorted(allowed_ids))
-            ids_tag = f"_ids_{ids_sorted.replace(',', '-')}"
-        output_csv = os.path.join(output_dir, f"benchmark_eval_{subset}_{timestamp}{ids_tag}.csv")
+        ids_tag = "" if allowed_ids is None else f"_ids_{','.join(str(x) for x in sorted(allowed_ids)).replace(',', '-')}"
+        output_csv = os.path.join(output_dir, f"{prefix}{timestamp}{ids_tag}.csv")
 
-    # 过滤掉已经跑过的题目
     remaining_df = df_questions[~df_questions["Question_ID"].astype(str).isin(processed_ids)].reset_index(drop=True)
 
     if remaining_df.empty:
@@ -155,6 +159,7 @@ def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str]):
         out_df = pd.DataFrame(results)
     else:
         print(f"\n🚀 [BENCHMARK MODE] Evaluating {len(remaining_df)} remaining questions (Sequential & Safe)...")
+        print(f"🔧 Ablation Settings: Use RAG = {use_rag}, Use Completion = {use_completion}")
         checkpoint_every = 5
 
         for idx, row in tqdm(remaining_df.iterrows(), total=len(remaining_df), desc="Running Benchmarks"):
@@ -167,7 +172,13 @@ def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str]):
             t_base, t_critic, t_comp, t_ans = None, None, None, None
 
             try:
-                pipeline_output = run_pipeline(question=question_text, q_type=q_type, question_id=qid)
+                pipeline_output = run_pipeline(
+                    question=question_text, 
+                    q_type=q_type, 
+                    question_id=qid,
+                    use_rag=use_rag,
+                    use_completion=use_completion
+                )
                 generated_answer = pipeline_output.get("final_answer", "")
                 retrieved_context = pipeline_output.get("final_context", "")
                 trace_dict = pipeline_output.get("trace", {})
@@ -209,7 +220,6 @@ def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str]):
             
             results.append(rec)
 
-            # 定期保存检查点
             if (idx + 1) % checkpoint_every == 0:
                 pd.DataFrame(results).to_csv(output_csv, index=False, encoding="utf-8-sig")
 
@@ -229,7 +239,7 @@ def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str]):
     print(f"✅ Report saved to: {output_csv}\n")
 
 
-def run_inference_mode(csv_path: str, limit: int):
+def run_inference_mode(csv_path: str, limit: int, use_rag: bool, use_completion: bool):
     if not os.path.exists(csv_path):
         logging.error(f"Input CSV not found: {csv_path}")
         return
@@ -244,7 +254,6 @@ def run_inference_mode(csv_path: str, limit: int):
         logging.error("The provided CSV is empty.")
         return
 
-    # 确保有一个唯一 ID 用于追踪断点
     if "Question_ID" not in df_questions.columns:
         df_questions["Question_ID"] = [f"Custom_Q_{i:04d}" for i in range(len(df_questions))]
 
@@ -255,12 +264,17 @@ def run_inference_mode(csv_path: str, limit: int):
     os.makedirs(output_dir, exist_ok=True)
 
     base_name = os.path.splitext(os.path.basename(csv_path))[0]
-    output_csv = os.path.join(output_dir, f"{base_name}_results.csv")
+    ablation_tag = ""
+    if not use_rag:
+        ablation_tag += "_NO_RAG"
+    if not use_completion:
+        ablation_tag += "_NO_COMPLETION"
+
+    output_csv = os.path.join(output_dir, f"{base_name}{ablation_tag}_results.csv")
 
     results = []
     processed_ids = set()
 
-    # 检查是否已有输出文件，支持断点续做
     if os.path.exists(output_csv):
         print(f"\n🔄 [RESUME MODE] Found existing output CSV: {output_csv}")
         try:
@@ -272,7 +286,6 @@ def run_inference_mode(csv_path: str, limit: int):
         except Exception as e:
             logging.warning(f"Could not load existing CSV for resume: {e}")
 
-    # 过滤掉已经跑过的题目
     remaining_df = df_questions[~df_questions["Question_ID"].astype(str).isin(processed_ids)].reset_index(drop=True)
 
     if remaining_df.empty:
@@ -280,14 +293,13 @@ def run_inference_mode(csv_path: str, limit: int):
         return
 
     print(f"\n🚀 [INFERENCE MODE] Evaluating {len(remaining_df)} remaining questions from CSV (Sequential & Safe)...")
+    print(f"🔧 Ablation Settings: Use RAG = {use_rag}, Use Completion = {use_completion}")
     checkpoint_every = 5
 
     for idx, row in tqdm(remaining_df.iterrows(), total=len(remaining_df), desc="Running Inference"):
         qid = row["Question_ID"]
-        
-        # 兼容不同的列名大小写
         question_text = row.get("Question", row.get("question", ""))
-        q_type = row.get("Type", row.get("type", "QA")) # 默认类型为 QA
+        q_type = row.get("Type", row.get("type", "QA")) 
 
         if not question_text or pd.isna(question_text):
             logging.warning(f"Row {qid} missing 'Question' text. Skipping.")
@@ -298,7 +310,13 @@ def run_inference_mode(csv_path: str, limit: int):
         t_base, t_critic, t_comp, t_ans = None, None, None, None
 
         try:
-            pipeline_output = run_pipeline(question=question_text, q_type=q_type, question_id=qid)
+            pipeline_output = run_pipeline(
+                question=question_text, 
+                q_type=q_type, 
+                question_id=qid,
+                use_rag=use_rag,
+                use_completion=use_completion
+            )
             generated_answer = pipeline_output.get("final_answer", "")
             retrieved_context = pipeline_output.get("final_context", "")
             trace_dict = pipeline_output.get("trace", {})
@@ -315,7 +333,6 @@ def run_inference_mode(csv_path: str, limit: int):
 
         t_total = time.time() - t_start
 
-        # 保留原 CSV 中的所有列，并追加 pipeline 的结果
         rec = row.to_dict()
         rec.update({
             "Generated_Answer": generated_answer,
@@ -329,11 +346,9 @@ def run_inference_mode(csv_path: str, limit: int):
         
         results.append(rec)
 
-        # 定期保存检查点
         if (idx + 1) % checkpoint_every == 0:
             pd.DataFrame(results).to_csv(output_csv, index=False, encoding="utf-8-sig")
 
-    # 循环结束后最后保存一次
     pd.DataFrame(results).to_csv(output_csv, index=False, encoding="utf-8-sig")
     print(f"\n✅ Inference complete. Report saved to: {output_csv}\n")
 
@@ -354,6 +369,11 @@ def main():
     )
     parser.add_argument("--csv", type=str, default=None, help="Path to a custom CSV file (Inference Mode)")
     parser.add_argument("--limit", type=int, default=0, help="Optional limit on number of questions to process")
+    
+    # Ablation Flags
+    parser.add_argument("--no-rag", action="store_true", help="Disable RAG completely (pure generation)")
+    parser.add_argument("--no-completion", action="store_true", help="Disable Critic and automatic supplementary retrieval")
+
     args = parser.parse_args()
 
     openai_key = os.environ.get("OPENAI_API_KEY")
@@ -374,11 +394,13 @@ def main():
         print("\nPlease set both environment variables before starting.")
         sys.exit(1)
 
-    # 核心改动：根据是否传入了 --csv 分支进入不同的执行模式
+    use_rag = not args.no_rag
+    use_completion = not args.no_completion
+
     if args.csv:
-        run_inference_mode(args.csv, args.limit)
+        run_inference_mode(args.csv, args.limit, use_rag=use_rag, use_completion=use_completion)
     else:
-        run_benchmark_mode(args.subset, args.limit, args.ids)
+        run_benchmark_mode(args.subset, args.limit, args.ids, use_rag=use_rag, use_completion=use_completion)
 
 
 if __name__ == "__main__":
