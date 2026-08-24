@@ -178,7 +178,6 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "", use_r
     t0 = time.time()
     if use_rag:
         logging.info("Step 1: Running Base Retrieval...")
-        # Kept at 8 to preserve the integrity of the baseline ablation tests
         base_passages, _, _ = retriever.get_retrieved_passages(
             question,
             top_k=8,

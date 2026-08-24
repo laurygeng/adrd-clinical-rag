@@ -4,11 +4,42 @@ import gc
 import sys
 import torch
 import traceback
+import re
 from types import SimpleNamespace
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 _model = None
 _tokenizer = None
+
+
+def _is_llama3_model(model_id: str) -> bool:
+    mid = (model_id or "").lower()
+    return "llama-3" in mid or "meta-llama-3" in mid
+
+
+def _clean_llama3_output(text: str, messages) -> str:
+    cleaned = (text or "").strip()
+
+    for marker in ["\nassistant:", "\nuser:", "assistant:", "user:", "<|start_header_id|>", "<|eot_id|>"]:
+        if marker in cleaned:
+            cleaned = cleaned.split(marker, 1)[0].strip()
+
+    last_user = str((messages or [{}])[-1].get("content", "") or "")
+    upper_cleaned = cleaned.upper()
+    upper_user = last_user.upper()
+
+    if "EXACTLY 'YES' OR 'NO'" in upper_user or 'EXACTLY "YES" OR "NO"' in upper_user:
+        if upper_cleaned.startswith("YES"):
+            return "Yes"
+        if upper_cleaned.startswith("NO"):
+            return "No"
+
+    if "EXACTLY ONE OPTION LETTER" in upper_user:
+        match = re.search(r"\b([A-E])\b", upper_cleaned)
+        if match:
+            return match.group(1)
+
+    return cleaned
 
 def _get_model_and_tokenizer():
     global _model, _tokenizer
@@ -52,6 +83,8 @@ def _get_model_and_tokenizer():
 class _ChatCompletions:
     def create(self, model, messages, temperature=0.7, max_tokens=1024, **kwargs):
         llm, tokenizer = _get_model_and_tokenizer()
+        model_id = os.environ.get("LOCAL_AGENT_A_MODEL", "")
+        is_llama3 = _is_llama3_model(model_id)
         
         try:
             input_ids = tokenizer.apply_chat_template(
@@ -67,9 +100,23 @@ class _ChatCompletions:
             inputs = {"input_ids": fallback_inputs.input_ids, "attention_mask": fallback_inputs.attention_mask}
         
         gen_kwargs = {
-            "max_new_tokens": max(32, max_tokens),
+            "max_new_tokens": int(max_tokens) if is_llama3 else max(32, int(max_tokens)),
             "do_sample": temperature > 0.0,
         }
+
+        if is_llama3:
+            eos_token_ids = []
+            if tokenizer.eos_token_id is not None:
+                eos_token_ids.append(int(tokenizer.eos_token_id))
+            try:
+                eot_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
+                if eot_id is not None and eot_id != tokenizer.unk_token_id:
+                    eos_token_ids.append(int(eot_id))
+            except Exception:
+                pass
+            if eos_token_ids:
+                gen_kwargs["eos_token_id"] = eos_token_ids
+                gen_kwargs["pad_token_id"] = eos_token_ids[0]
         
         if temperature > 0.0:
             gen_kwargs["temperature"] = float(temperature)
@@ -93,6 +140,8 @@ class _ChatCompletions:
                 generated_tokens = seq.tolist()
                 
             generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+            if is_llama3:
+                generated_text = _clean_llama3_output(generated_text, messages)
             
         except Exception as e:
             # 🚨 强制熔断机制 1：代码执行报错，立刻停机！

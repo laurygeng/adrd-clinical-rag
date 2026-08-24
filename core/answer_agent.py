@@ -49,6 +49,36 @@ def _normalize_yesno(s: str) -> str:
     return ""
 
 
+def _extract_yesno_answer(text: str) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+
+    direct = _normalize_yesno(raw)
+    if direct:
+        return direct
+
+    match = re.search(r"\b(YES|NO|TRUE|FALSE|Y|N|T|F)\b", raw, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return _normalize_yesno(match.group(1))
+
+
+def _extract_mc_answer(text: str) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+
+    compact = re.sub(r"[^A-Z]", "", raw.upper())
+    if compact and compact[0] in "ABCDE":
+        return compact[0]
+
+    match = re.search(r"\b([A-E])\b", raw.upper())
+    if match:
+        return match.group(1)
+    return ""
+
+
 def generate_tf_final_answer_locked(
     client,
     question: str,
@@ -190,7 +220,17 @@ def generate_final_answer(client, question: str, context: str, q_type: str, mode
             temperature=0.0,
             max_tokens=target_max_tokens,
         )
-        return response.choices[0].message.content.strip()
+        raw_output = (response.choices[0].message.content or "").strip()
+
+        if q_type == "TF":
+            parsed = _extract_yesno_answer(raw_output)
+            return parsed or raw_output
+
+        if q_type == "MC":
+            parsed = _extract_mc_answer(raw_output)
+            return parsed or raw_output
+
+        return raw_output
     except Exception as e:
         logging.error(f"Answer Agent API error: {e}")
         return f"Error: {e}"
