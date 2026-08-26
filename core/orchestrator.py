@@ -24,7 +24,7 @@ from openai import OpenAI
 from core.advanced_retriever import AdvancedRetriever
 from core.critic_agent import evaluate_sufficiency
 from core.answer_agent import generate_final_answer
-from core.search_agent import research
+from core.search_agent import clean_search_query_text, research
 from core.trace_logger import write_jsonl, make_item_id, get_run_dir
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -96,6 +96,39 @@ def sanitize_gap_text(gap: str) -> str:
     return g[:800]
 
 
+def _take_passages_with_budget(passages: List[str], max_items: int, max_chars: int) -> List[str]:
+    out: List[str] = []
+    total = 0
+    for p in passages or []:
+        text = (p or "").strip()
+        if not text:
+            continue
+        if len(out) >= max_items:
+            break
+        if total + len(text) > max_chars and out:
+            break
+        out.append(text)
+        total += len(text)
+    return out
+
+
+def _build_completion_context(base_passages: List[str], gap_passages: List[str], web_passages: List[str]) -> str:
+    sections: List[str] = []
+
+    base_selected = _take_passages_with_budget(deduplicate_passages(base_passages), max_items=4, max_chars=6500)
+    gap_selected = _take_passages_with_budget(deduplicate_passages(gap_passages), max_items=2, max_chars=2500)
+    web_selected = _take_passages_with_budget(deduplicate_passages(web_passages), max_items=2, max_chars=3000)
+
+    if base_selected:
+        sections.append("--- Base Retrieved Evidence ---\n" + "\n\n".join(base_selected))
+    if gap_selected:
+        sections.append("--- Completion Gap Evidence ---\n" + "\n\n".join(gap_selected))
+    if web_selected:
+        sections.append("--- External Web Evidence ---\n" + "\n\n".join(web_selected))
+
+    return "\n\n".join(sections).strip()
+
+
 def generate_web_rewrite_query(statement: str, gap_hint: str = "") -> str:
     s = statement.strip()
     gh = sanitize_gap_text(gap_hint)
@@ -123,11 +156,11 @@ def generate_web_rewrite_query(statement: str, gap_hint: str = "") -> str:
                 {"role": "user", "content": user_prompt}
             ]
         )
-        query = (r.choices[0].message.content or "").strip().strip('"\'')
+        query = clean_search_query_text(r.choices[0].message.content or "", fallback=f"{s} {gh}")
         return query if query else f"{s} {gh}"
     except Exception as e:
         logging.warning(f"Query rewrite LLM call failed: {e}")
-        return f"{s}\n\nSearch query focus: {gh}".strip()
+        return clean_search_query_text(f"{s} {gh}", fallback=s)
 
 
 def run_pipeline(question: str, q_type: str = "MC", question_id: str = "", use_rag: bool = True, use_completion: bool = True) -> Dict[str, Any]:
@@ -257,8 +290,7 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "", use_r
         
         # [Tagging & Isolation]: Tag sources only during completion merging to preserve base ablation integrity
         gap_tagged = [f"[GAP] {p}" for p in gap_passages]
-        # Compress base passages to top 5 to make safe room for external knowledge
-        base_tagged = [f"[BASE] {p}" for p in base_passages[:5]]
+        base_tagged = [f"[BASE] {p}" for p in base_passages]
 
         web_passages: List[str] = []
         try:
@@ -273,22 +305,11 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "", use_r
             logging.warning(f"Web retrieval failed: {e}. Proceeding with local gap passages only.")
             trace_log["web_query_used"] = ""
 
-        # Prioritize tagged passages: Base(5) -> Gap(2) -> Web(2)
-        prioritized_passages = base_tagged + gap_tagged + web_passages[:2]
-        merged_passages = deduplicate_passages(prioritized_passages)
-        
-        # [Double Circuit Breaker]: Hard limit on noise to prevent context overload
-        MAX_CONTEXT_CHARS = 12000
-        current_chars = 0
-        final_passages = []
-        
-        for p in merged_passages[:8]:
-            if current_chars + len(p) > MAX_CONTEXT_CHARS and len(final_passages) >= 4:
-                break
-            final_passages.append(p)
-            current_chars += len(p)
-            
-        final_context = "\n\n".join(final_passages)
+        final_context = _build_completion_context(
+            base_passages=base_tagged,
+            gap_passages=gap_tagged,
+            web_passages=web_passages,
+        )
     else:
         if not use_completion:
             logging.info("Step 3-5: SKIPPED (Ablation: No Completion Retrieval)")

@@ -189,16 +189,31 @@ def generate_final_answer(client, question: str, context: str, q_type: str, mode
 
     if q_type == "TF":
         # [Modified] Tightened the decision rule to strictly prevent model hallucination or over-inference.
+        # strict_instruction += (
+        #     "2. FORMAT: Output ONLY the final answer, with no explanation, preamble, or extra text.\n"
+        #     "3. DECISION RULE: Answer 'Yes' ONLY IF the context explicitly and directly confirms the statement. "
+        #     "Answer 'No' if the context contradicts it, lacks direct confirmation, or is ambiguous. Do not infer.\n"
+        #     "4. Your output must be EXACTLY 'Yes' or 'No'."
+        # )
         strict_instruction += (
             "2. FORMAT: Output ONLY the final answer, with no explanation, preamble, or extra text.\n"
-            "3. DECISION RULE: Answer 'Yes' ONLY IF the context explicitly and directly confirms the statement. "
-            "Answer 'No' if the context contradicts it, lacks direct confirmation, or is ambiguous. Do not infer.\n"
+            "3. DECISION RULE: Evaluate the statement strictly and objectively against the context.\n"
+            "   - Answer 'Yes' ONLY IF the context logically supports the statement. It is acceptable if the context uses synonymous medical terminology or if a specific number falls within a clearly stated range.\n"
+            "   - Answer 'No' if the context contradicts the statement OR if the context lacks sufficient information to verify it.\n"
+            "   - Do NOT guess, infer, or rely on external knowledge if the context is silent.\n"
             "4. Your output must be EXACTLY 'Yes' or 'No'."
         )
     elif q_type == "MC":
+        # strict_instruction += (
+        #     "2. FORMAT: Output ONLY the final answer, with no explanation, preamble, or extra text.\n"
+        #     "3. Your output must be EXACTLY ONE option letter (A, B, C, D, or E) — the one best supported by the context."
+        # )
         strict_instruction += (
-            "2. FORMAT: Output ONLY the final answer, with no explanation, preamble, or extra text.\n"
-            "3. Your output must be EXACTLY ONE option letter (A, B, C, D, or E) — the one best supported by the context."
+            "2. FORMAT: Output ONLY the option letter, with no explanation, preamble, or extra text.\n"
+            "3. DECISION RULE: Evaluate EVERY option independently against the context. "
+            "PAY SPECIAL ATTENTION to inclusive options like 'All of the above' or 'A and B'. "
+            "If multiple individual options are supported by the context, you MUST select the inclusive option.\n"
+            "4. Your output must be EXACTLY ONE option letter (A, B, C, D, or E)."
         )
     elif q_type == "QA":
         strict_instruction += "2. Provide a supportive, concise, and factual answer based ONLY on the context."

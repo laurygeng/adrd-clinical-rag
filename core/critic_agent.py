@@ -8,6 +8,7 @@ Unified System:
 """
 
 import os
+import re
 import time
 import logging
 import traceback
@@ -101,13 +102,69 @@ def _is_none_strict(x: str) -> bool:
     return str(x).strip().upper() == "NONE"
 
 
-def _is_valid_gap(x: str) -> bool:
-    t = str(x or "").strip()
+def _normalize_gap_text(x: str) -> str:
+    t = str(x or "").strip().strip("`")
     if not t:
+        return ""
+
+    t = t.replace("\r\n", "\n")
+    low = t.lower()
+
+    if low == "none":
+        return "NONE"
+
+    if re.search(r"(?i)\bcontext\s*:", t) or re.search(r"(?i)\bquestion\s*:", t) or re.search(r"(?i)\bstatement\s*:", t):
+        return ""
+
+    t = re.sub(r"(?is)^answer\s*:\s*(yes|no|true|false)\s*", "", t).strip()
+    t = re.sub(
+        r"(?is)^.*?single most important piece of information still missing(?: from the context)?(?: needed to [^:]+)?\s*(?:is|:)\s*",
+        "",
+        t,
+    ).strip()
+    t = re.sub(r"(?is)^the answer is\s*:\s*", "", t).strip()
+    t = re.sub(r"(?is)\bwithout this information.*$", "", t).strip()
+    t = re.sub(r"(?is)\btherefore,?\s*", "", t).strip()
+
+    lines = []
+    for raw_line in t.splitlines():
+        line = raw_line.strip().strip("-*•`\"'")
+        if not line:
+            continue
+        if line.lower() in {"yes", "no", "true", "false", "none"}:
+            if line.lower() == "none":
+                return "NONE"
+            continue
+        if re.match(r"(?i)^(answer|context|question|statement|user|system)\s*:", line):
+            continue
+        lines.append(line)
+
+    if not lines:
+        return ""
+
+    cleaned = lines[0]
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().strip("\"'")
+    cleaned = cleaned.rstrip(".,;: ")
+    return cleaned
+
+
+def _is_valid_gap(x: str) -> bool:
+    t = _normalize_gap_text(x)
+    if not t:
+        return False
+    if t == "NONE":
         return False
     if len(t) < 3:
         return False
+    if len(t) > 180:
+        return False
     if t.endswith("..."):
+        return False
+    if "\n" in t:
+        return False
+    if re.search(r"(?i)\b(answer|context|question|statement)\b\s*:", t):
+        return False
+    if t.count(".") > 1:
         return False
     return True
 
@@ -348,21 +405,28 @@ def evaluate_sufficiency(
 
             for agent, txt in (("openai", o), ("gemini", g)):
                 n_votes += 1
+                normalized = _normalize_gap_text(txt)
                 if _is_empty(txt):
                     label = "EMPTY"
                     empty_count += 1
-                elif _is_none_strict(txt):
+                elif _is_none_strict(normalized or txt):
                     label = "NONE"
                     none_count_strict += 1
                 else:
-                    if _is_valid_gap(txt):
+                    if _is_valid_gap(normalized):
                         label = "GAP_VALID"
-                        valid_gaps.append(txt.strip())
+                        valid_gaps.append(normalized.strip())
                     else:
                         label = "GAP_INVALID"
-                        invalid_gaps.append(txt.strip())
+                        invalid_gaps.append((normalized or txt).strip())
 
-                trace["votes"].append({"round": r, "agent": agent, "text": txt, "label": label})
+                trace["votes"].append({
+                    "round": r,
+                    "agent": agent,
+                    "text": txt,
+                    "normalized_text": normalized,
+                    "label": label,
+                })
 
         trace["none_frac_strict"] = float(none_count_strict / max(n_votes, 1))
         trace["empty_frac"] = float(empty_count / max(n_votes, 1))
