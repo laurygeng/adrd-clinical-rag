@@ -26,6 +26,42 @@ from openai import OpenAI
 UA = {"User-Agent": "adrd-medical-rag/2.0"}
 
 
+def clean_search_query_text(text: str, fallback: str = "") -> str:
+    raw = str(text or "").replace("\r\n", "\n").strip()
+    fb = str(fallback or "").replace("\r\n", "\n").strip()
+
+    if not raw:
+        raw = fb
+
+    raw = re.sub(r"```.*?```", " ", raw, flags=re.S)
+    raw = re.split(r"(?i)\blet me know if you need", raw, maxsplit=1)[0]
+    raw = re.sub(r"(?i)^\s*(search\s+query|query|google\s+query|output)\s*:\s*", "", raw).strip()
+    raw = re.sub(r"(?i).*?single most important piece of information still missing(?: from the context)?(?: needed to [^:]+)?\s*(?:is|:)\s*", "", raw).strip()
+    raw = re.sub(r"(?i).*?missing information(?: from the context)?(?: needed to [^:]+)?\s*(?:is|:)\s*", "", raw).strip()
+    raw = re.sub(r"(?i)\bwithout this information.*$", "", raw).strip()
+
+    parts = []
+    for line in raw.splitlines():
+        line = line.strip().strip("-*•`\"'")
+        if not line:
+            continue
+        if re.match(r"(?i)^\(note[:\)]", line):
+            continue
+        if re.match(r"(?i)^(here('| i)?s|this query|note:|answer:|context:|question:|statement:)\b", line):
+            continue
+        parts.append(line)
+
+    cleaned = parts[0] if parts else raw
+    cleaned = re.split(r"(?i)\b(?:because|without|therefore|so that|which means|this means)\b", cleaned, maxsplit=1)[0]
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().strip("\"'")
+    cleaned = cleaned[:160].strip()
+
+    if len(cleaned) < 3:
+        cleaned = re.sub(r"\s+", " ", fb).strip().strip("\"'")[:160]
+
+    return cleaned
+
+
 def _generate_query(client: OpenAI, target_info: str, model: str = "gpt-4o-mini") -> str:
     """Generate a single precise search query based on the target missing information."""
     prompt = (
@@ -42,11 +78,11 @@ def _generate_query(client: OpenAI, target_info: str, model: str = "gpt-4o-mini"
             max_tokens=40,
             messages=[{"role": "user", "content": prompt}],
         )
-        q = (r.choices[0].message.content or "").strip().strip('"\'')
-        return q if q else target_info
+        q = clean_search_query_text(r.choices[0].message.content or "", fallback=target_info)
+        return q if q else clean_search_query_text(target_info, fallback=target_info)
     except Exception:
         # Fallback to raw target_info if query generation fails
-        return target_info
+        return clean_search_query_text(target_info, fallback=target_info)
 
 
 def _exa(query: str, n: int = 3) -> List[Dict[str, str]]:

@@ -22,9 +22,9 @@ from datetime import datetime
 from openai import OpenAI
 
 from core.advanced_retriever import AdvancedRetriever
-from core.critic_agent import evaluate_sufficiency
+from core.critic_agent import CRITIC_CALLS_PER_AGENT, evaluate_sufficiency
 from core.answer_agent import generate_final_answer
-from core.search_agent import research
+from core.search_agent import clean_search_query_text, research
 from core.trace_logger import write_jsonl, make_item_id, get_run_dir
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -90,10 +90,10 @@ def format_evidence_items(evidence_items: List[Union[str, Dict[str, Any]]]) -> L
 def sanitize_gap_text(gap: str) -> str:
     if gap is None:
         return ""
-    g = str(gap).strip()
+    g = clean_search_query_text(str(gap), fallback="")
     if not g:
         return ""
-    return g[:800]
+    return g[:160]
 
 
 def generate_web_rewrite_query(statement: str, gap_hint: str = "") -> str:
@@ -123,11 +123,11 @@ def generate_web_rewrite_query(statement: str, gap_hint: str = "") -> str:
                 {"role": "user", "content": user_prompt}
             ]
         )
-        query = (r.choices[0].message.content or "").strip().strip('"\'')
-        return query if query else f"{s} {gh}"
+        query = clean_search_query_text(r.choices[0].message.content or "", fallback=f"{s} {gh}")
+        return query if query else clean_search_query_text(f"{s} {gh}", fallback=s)
     except Exception as e:
         logging.warning(f"Query rewrite LLM call failed: {e}")
-        return f"{s}\n\nSearch query focus: {gh}".strip()
+        return clean_search_query_text(f"{s} {gh}", fallback=s)
 
 
 def run_pipeline(question: str, q_type: str = "MC", question_id: str = "", use_rag: bool = True, use_completion: bool = True) -> Dict[str, Any]:
@@ -199,7 +199,7 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "", use_r
             question=question,
             context=base_context,
             q_type=q_type,
-            calls_per_agent=5,
+            calls_per_agent=CRITIC_CALLS_PER_AGENT,
             question_id=question_id,
             retriever=retriever,
         )

@@ -12,6 +12,7 @@ import time
 import logging
 import traceback
 import json
+import re
 from datetime import datetime
 from typing import Tuple, List, Dict, Any, Optional
 
@@ -42,6 +43,10 @@ _emb_model: Optional[SentenceTransformer] = None
 _oai_client: Optional[OpenAI] = None
 _gem_client = None
 
+CRITIC_CALLS_PER_AGENT = int(os.environ.get("CRITIC_CALLS_PER_AGENT", "3"))
+CRITIC_OPENAI_TEMPERATURE = float(os.environ.get("CRITIC_OPENAI_TEMPERATURE", "0.0"))
+CRITIC_GEMINI_TEMPERATURE = float(os.environ.get("CRITIC_GEMINI_TEMPERATURE", "0.0"))
+
 
 # ----------------------------
 # Model/client getters
@@ -71,22 +76,31 @@ def get_gem_client():
 # ----------------------------
 # Prompts
 # ----------------------------
+_CRITIC_FORMAT_RULES = (
+    "Return EXACTLY two lines in this format:\n"
+    "SUFFICIENT: YES or NO\n"
+    "GAP: NONE or <one short missing fact phrase>\n"
+    "Rules: Do NOT answer the original question. Do NOT repeat the context. Do NOT output Explanation, Answer, "
+    "Question, Statement, Context, System, or User. If the context is sufficient, output 'SUFFICIENT: YES' and "
+    "'GAP: NONE'. If the context is insufficient, output 'SUFFICIENT: NO' and a gap of at most 12 words."
+)
+
 SYS_ID_MC = (
-    "You judge whether a CONTEXT is sufficient to answer a multiple-choice question. Name the SINGLE most "
-    "important piece of information still MISSING from the context needed to confidently determine the correct "
-    "option. If the context already contains everything needed, answer exactly 'NONE'. One short phrase only."
+    "You judge whether a CONTEXT is sufficient to answer a multiple-choice question. Identify only whether the "
+    "context is sufficient and, if not, the single most important missing fact needed to determine the correct "
+    f"option. {_CRITIC_FORMAT_RULES}"
 )
 
 SYS_ID_TF = (
-    "You judge whether a CONTEXT is sufficient to decide if a TRUE/FALSE statement is true or false. Name the "
-    "SINGLE most important piece of information still MISSING from the context needed to confidently decide. "
-    "If the context already contains everything needed, answer exactly 'NONE'. One short phrase only."
+    "You judge whether a CONTEXT is sufficient to decide if a TRUE/FALSE statement is true or false. Identify only "
+    "whether the context is sufficient and, if not, the single most important missing fact needed to decide. "
+    f"{_CRITIC_FORMAT_RULES}"
 )
 
 SYS_ID_QA = (
-    "You judge whether a CONTEXT is sufficient to accurately answer an open-ended question. Name the SINGLE most "
-    "important piece of information still MISSING from the context needed to confidently provide a complete answer. "
-    "If the context already contains everything needed, answer exactly 'NONE'. One short phrase only."
+    "You judge whether a CONTEXT is sufficient to answer an open-ended question completely and accurately. Identify "
+    "only whether the context is sufficient and, if not, the single most important missing fact needed to answer. "
+    f"{_CRITIC_FORMAT_RULES}"
 )
 
 
@@ -101,15 +115,189 @@ def _is_none_strict(x: str) -> bool:
     return str(x).strip().upper() == "NONE"
 
 
-def _is_valid_gap(x: str) -> bool:
-    t = str(x or "").strip()
+def _parse_critic_response(x: str) -> Dict[str, Any]:
+    raw = str(x or "").strip()
+    parsed: Dict[str, Any] = {
+        "raw": raw,
+        "sufficient": None,
+        "gap": "",
+        "normalized_gap": "",
+        "used_structured": False,
+    }
+    if not raw:
+        return parsed
+
+    sufficient_match = re.search(r"(?im)^\s*sufficient\s*:\s*(yes|no|true|false)\b", raw)
+    gap_match = re.search(r"(?im)^\s*gap\s*:\s*(.+)$", raw)
+    if sufficient_match:
+        parsed["used_structured"] = True
+        sufficient_token = sufficient_match.group(1).strip().upper()
+        parsed["sufficient"] = sufficient_token in {"YES", "TRUE"}
+    if gap_match:
+        parsed["used_structured"] = True
+        parsed["gap"] = gap_match.group(1).strip()
+
+    if parsed["used_structured"]:
+        gap = str(parsed["gap"] or "").strip().strip("`\"'")
+        gap = re.sub(r"\s+", " ", gap)
+        if parsed["sufficient"] is True or gap.upper() == "NONE":
+            parsed["normalized_gap"] = "NONE"
+        else:
+            parsed["normalized_gap"] = gap[:180].strip().rstrip(" .,:;-")
+        return parsed
+
+    upper = raw.upper()
+    if upper == "NONE":
+        parsed["normalized_gap"] = "NONE"
+        return parsed
+    if "CONTEXT ALREADY CONTAINS EVERYTHING NEEDED" in upper:
+        parsed["normalized_gap"] = "NONE"
+        return parsed
+
+    return parsed
+
+
+def _normalize_gap_text(x: str) -> str:
+    t = str(x or "").strip().strip("`")
     if not t:
+        return ""
+
+    parsed = _parse_critic_response(x)
+    if parsed.get("normalized_gap"):
+        return str(parsed["normalized_gap"])
+
+    t = t.replace("\r\n", "\n")
+    t = re.sub(r"```.*?```", " ", t, flags=re.S)
+    t = re.sub(r"\s+", " ", t).strip()
+
+    if t.upper() == "NONE":
+        return "NONE"
+
+    if re.search(r"(?is)\b(system|user|assistant|context|question|statement|answer|explanation)\s*:", t):
+        return ""
+
+    patterns = [
+        r"(?is).*?single most important piece of information still missing(?: from the context)?(?: needed to [^:]+)?\s*(?:is|:)\s*",
+        r"(?is).*?most important piece of information missing(?: from the context)?(?: needed to [^:]+)?\s*(?:is|:)\s*",
+        r"(?is).*?missing information(?: from the context)?(?: needed to [^:]+)?\s*(?:is|:)\s*",
+        r"(?is).*?the answer is\s*:\s*",
+    ]
+    for pat in patterns:
+        stripped = re.sub(pat, "", t).strip()
+        if stripped != t:
+            t = stripped
+            break
+
+    t = re.sub(r"(?is)^answer\s*:\s*(yes|no|true|false)\b", "", t).strip()
+    t = re.sub(r"(?is)^explanation\s*:\s*", "", t).strip()
+    t = re.sub(r"(?is)^because\b.*$", "", t).strip()
+    t = re.sub(r"(?is)\bwithout this information.*$", "", t).strip()
+    t = re.sub(r"(?is)\bthe context provided does not contain information about\b", "", t).strip()
+    t = re.sub(r"(?is)\bthe context does not contain information about\b", "", t).strip()
+    t = re.sub(r"(?is)\bthe context does not provide\b", "", t).strip()
+    t = re.sub(r"(?is)\bto confidently decide.*$", "", t).strip()
+    t = re.sub(r"(?is)\bto determine .*?\bis\b", "", t).strip()
+
+    line_candidates: List[str] = []
+    for raw_line in str(x or "").replace("\r\n", "\n").splitlines():
+        line = raw_line.strip().strip("-*•`\"'")
+        if not line:
+            continue
+        lower = line.lower()
+        if lower in {"yes", "no", "true", "false", "none"}:
+            continue
+        if any(token in lower for token in ["context:", "question:", "statement:", "answer:", "explanation:", "system:", "user:", "assistant:"]):
+            continue
+        if "single most important piece of information" in lower or "missing information" in lower:
+            norm = _normalize_gap_text(line)
+            if norm and norm != "NONE":
+                line_candidates.append(norm)
+            continue
+        line_candidates.append(line)
+
+    if line_candidates:
+        ranked = sorted(
+            line_candidates,
+            key=lambda s: (
+                any(ch.isdigit() for ch in s),
+                any(k in s.lower() for k in ["risk", "rate", "prevalence", "percent", "percentage", "age", "guideline", "definition"]),
+                -len(s),
+            ),
+            reverse=True,
+        )
+        t = ranked[0]
+
+    t = re.split(r"(?<=[.;!?])\s+(?:because|without|therefore|so that|which means|this means)\b", t, maxsplit=1, flags=re.I)[0]
+    t = re.split(r"\b(?:because|without|therefore|so that|which means|this means)\b", t, maxsplit=1, flags=re.I)[0]
+    t = re.sub(r"\s+", " ", t).strip().strip("\"'")
+    t = t.rstrip(" .,:;-")
+    return t[:180].strip()
+
+
+def _is_valid_gap(x: str) -> bool:
+    t = _normalize_gap_text(x)
+    if not t:
+        return False
+    if t == "NONE":
         return False
     if len(t) < 3:
         return False
+    if len(t) > 180:
+        return False
+    if len(t.split()) > 12:
+        return False
     if t.endswith("..."):
         return False
+    if "\n" in t:
+        return False
+    if re.search(r"(?i)\b(context|question|statement|answer|explanation)\s*:", t):
+        return False
+    if re.search(r"(?i)\b(true or false|option\s+[A-E]|assistant|system|user)\b", t):
+        return False
     return True
+
+
+def _extract_mc_options(question: str) -> Dict[str, str]:
+    options: Dict[str, str] = {}
+    for line in str(question or "").splitlines():
+        m = re.match(r"\s*([A-E])\.\s*(.+?)\s*$", line)
+        if m:
+            options[m.group(1).upper()] = m.group(2).strip()
+    return options
+
+
+def _looks_like_direct_answer(x: str, q_type: str, question: str) -> bool:
+    t = _normalize_gap_text(x)
+    if not t:
+        return False
+
+    q_type_u = str(q_type or "").strip().upper()
+    lower_t = t.lower().strip()
+
+    if q_type_u == "TF":
+        return lower_t in {"true", "false", "yes", "no", "answer true", "answer false", "answer yes", "answer no"}
+
+    if q_type_u == "MC":
+        if re.fullmatch(r"[A-E]", t):
+            return True
+
+        option_match = re.match(r"^([A-E])(?:[\).:\-]|\s)+(.*)$", t)
+        options = _extract_mc_options(question)
+        if option_match:
+            letter = option_match.group(1).upper()
+            remainder = option_match.group(2).strip().lower()
+            if letter in options:
+                option_text = options[letter].lower()
+                if not remainder or remainder == option_text or option_text in remainder or remainder in option_text:
+                    return True
+
+        normalized_options = {v.lower() for v in _extract_mc_options(question).values() if v}
+        if lower_t in normalized_options:
+            return True
+        if any(lower_t == f"{k.lower()}. {v.lower()}" for k, v in _extract_mc_options(question).items()):
+            return True
+
+    return False
 
 
 def _gap_is_negative(gap: str) -> bool:
@@ -160,8 +348,11 @@ def _call_gemini(sys_prompt: str, user_prompt: str, temperature: float = 0.2, ma
             config={"temperature": temperature, "max_output_tokens": max_tokens},
         )
         txt = getattr(resp, "text", "") or ""
+        if not str(txt).strip():
+            logging.warning("Critic gemini call returned empty output.")
         return str(txt).strip()
-    except Exception:
+    except Exception as e:
+        logging.warning(f"Critic gemini call failed: {e}")
         return ""
 
 
@@ -256,7 +447,9 @@ def _format_itv_markdown(trace: Dict[str, Any]) -> str:
     lines.append("## Context (FULL)\n```text\n" + (trace.get("context") or "") + "\n```\n")
     lines.append("\n## Identify Votes\n")
     for v in trace.get("votes", []) or []:
-        lines.append(f"- Round {v.get('round')} | {v.get('agent')}: ({v.get('label')}) {v.get('text')}")
+        normalized = (v.get("normalized_text") or "").strip()
+        suffix = f" => {normalized}" if normalized and normalized != (v.get("text") or "").strip() else ""
+        lines.append(f"- Round {v.get('round')} | {v.get('agent')}: ({v.get('label')}) {v.get('text')}{suffix}")
     lines.append("\n## Consensus details\n```json\n" + str(trace.get("consensus_debug", {})) + "\n```\n")
 
     if trace.get("verify_mode") == "locate_reranker":
@@ -275,7 +468,7 @@ def evaluate_sufficiency(
     question: str,
     context: str,
     q_type: str = "MC",
-    calls_per_agent: int = 5,
+    calls_per_agent: int = CRITIC_CALLS_PER_AGENT,
     question_id: str = None,
     retriever=None,
     verify_threshold: float = 0.55,
@@ -341,28 +534,54 @@ def evaluate_sufficiency(
         empty_count = 0
         none_count_strict = 0
         n_votes = 0
+        calls_per_agent = max(1, int(calls_per_agent or CRITIC_CALLS_PER_AGENT))
+        trace["calls_per_agent"] = calls_per_agent
 
         for r in range(1, calls_per_agent + 1):
-            o = _call_openai(sys_id, user_prompt, temperature=0.7, max_tokens=40)
-            g = _call_gemini(sys_id, user_prompt, temperature=0.2, max_tokens=256)
+            o = _call_openai(
+                sys_id,
+                user_prompt,
+                temperature=CRITIC_OPENAI_TEMPERATURE,
+                max_tokens=32,
+            )
+            g = _call_gemini(
+                sys_id,
+                user_prompt,
+                temperature=CRITIC_GEMINI_TEMPERATURE,
+                max_tokens=48,
+            )
 
             for agent, txt in (("openai", o), ("gemini", g)):
                 n_votes += 1
+                parsed = _parse_critic_response(txt)
+                normalized = _normalize_gap_text(txt)
+                direct_answer = _looks_like_direct_answer(normalized or txt, q_type_u, question)
                 if _is_empty(txt):
                     label = "EMPTY"
                     empty_count += 1
-                elif _is_none_strict(txt):
+                elif parsed.get("sufficient") is True or _is_none_strict(normalized or txt):
                     label = "NONE"
                     none_count_strict += 1
                 else:
-                    if _is_valid_gap(txt):
+                    if direct_answer:
+                        label = "GAP_INVALID"
+                        invalid_gaps.append((normalized or txt).strip())
+                    elif _is_valid_gap(normalized):
                         label = "GAP_VALID"
-                        valid_gaps.append(txt.strip())
+                        valid_gaps.append(normalized.strip())
                     else:
                         label = "GAP_INVALID"
-                        invalid_gaps.append(txt.strip())
+                        invalid_gaps.append((normalized or txt).strip())
 
-                trace["votes"].append({"round": r, "agent": agent, "text": txt, "label": label})
+                trace["votes"].append({
+                    "round": r,
+                    "agent": agent,
+                    "text": txt,
+                    "parsed_sufficient": parsed.get("sufficient"),
+                    "used_structured": parsed.get("used_structured", False),
+                    "normalized_text": normalized,
+                    "label": label,
+                })
 
         trace["none_frac_strict"] = float(none_count_strict / max(n_votes, 1))
         trace["empty_frac"] = float(empty_count / max(n_votes, 1))
