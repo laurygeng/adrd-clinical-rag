@@ -44,8 +44,9 @@ _oai_client: Optional[OpenAI] = None
 _gem_client = None
 
 CRITIC_CALLS_PER_AGENT = int(os.environ.get("CRITIC_CALLS_PER_AGENT", "3"))
-CRITIC_OPENAI_TEMPERATURE = float(os.environ.get("CRITIC_OPENAI_TEMPERATURE", "0.0"))
-CRITIC_GEMINI_TEMPERATURE = float(os.environ.get("CRITIC_GEMINI_TEMPERATURE", "0.0"))
+# [MODIFIED] Increased default temperature from 0.0 to 0.5 to enable true multi-path sampling for consensus
+CRITIC_OPENAI_TEMPERATURE = float(os.environ.get("CRITIC_OPENAI_TEMPERATURE", "0.5"))
+CRITIC_GEMINI_TEMPERATURE = float(os.environ.get("CRITIC_GEMINI_TEMPERATURE", "0.5"))
 
 
 # ----------------------------
@@ -76,13 +77,16 @@ def get_gem_client():
 # ----------------------------
 # Prompts
 # ----------------------------
+# [MODIFIED] Enforce strict JSON output to prevent 7B/8B models from breaking format
 _CRITIC_FORMAT_RULES = (
-    "Return EXACTLY two lines in this format:\n"
-    "SUFFICIENT: YES or NO\n"
-    "GAP: NONE or <one short missing fact phrase>\n"
-    "Rules: Do NOT answer the original question. Do NOT repeat the context. Do NOT output Explanation, Answer, "
-    "Question, Statement, Context, System, or User. If the context is sufficient, output 'SUFFICIENT: YES' and "
-    "'GAP: NONE'. If the context is insufficient, output 'SUFFICIENT: NO' and a gap of at most 12 words."
+    "You MUST output your answer strictly as a valid JSON object. Do not include any other text, explanation, or markdown formatting.\n"
+    "{\n"
+    '  "sufficient": true or false,\n'
+    '  "gap": "NONE" or "<a single short missing fact phrase>"\n'
+    "}\n"
+    "Rules: Do NOT answer the original question. Do NOT repeat the context. "
+    "If the context is sufficient, output true and NONE. "
+    "If the context is insufficient, output false and a gap of at most 12 words."
 )
 
 SYS_ID_MC = (
@@ -127,6 +131,30 @@ def _parse_critic_response(x: str) -> Dict[str, Any]:
     if not raw:
         return parsed
 
+    # [MODIFIED] 1. Try to parse as JSON first (Best for Llama-3/Med-7B)
+    json_str = re.sub(r"```json|```", "", raw).strip()
+    try:
+        # Extract everything between { and } to ignore leading/trailing model chatter
+        match = re.search(r"\{.*\}", json_str, re.DOTALL)
+        if match:
+            json_str = match.group(0)
+            
+        data = json.loads(json_str)
+        if "sufficient" in data:
+            parsed["sufficient"] = bool(data["sufficient"])
+            parsed["gap"] = str(data.get("gap", "NONE")).strip()
+            parsed["used_structured"] = True
+            
+            gap_upper = parsed["gap"].upper()
+            if parsed["sufficient"] is True or gap_upper == "NONE" or not parsed["gap"]:
+                parsed["normalized_gap"] = "NONE"
+            else:
+                parsed["normalized_gap"] = parsed["gap"][:180].strip()
+            return parsed
+    except Exception:
+        pass # Fallback to regex if JSON parsing fails entirely
+
+    # 2. Fallback to regex extraction (Legacy support)
     sufficient_match = re.search(r"(?im)^\s*sufficient\s*:\s*(yes|no|true|false)\b", raw)
     gap_match = re.search(r"(?im)^\s*gap\s*:\s*(.+)$", raw)
     if sufficient_match:
@@ -322,28 +350,30 @@ def _gap_is_negative(gap: str) -> bool:
 # ----------------------------
 # Model calls: Identify
 # ----------------------------
-def _call_openai(sys_prompt: str, user_prompt: str, temperature: float = 0.7, max_tokens: int = 40) -> str:
+def _call_openai(sys_prompt: str, user_prompt: str, temperature: float = 0.5, max_tokens: int = 40) -> str:
     try:
         c = get_oai_client()
         r = c.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o",  # Fallback mapping caught by your shim
             temperature=temperature,
             max_tokens=max_tokens,
             messages=[
                 {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": user_prompt},
             ],
+            response_format={"type": "json_object"} # optional hint if your shim supports it
         )
         return (r.choices[0].message.content or "").strip()
-    except Exception:
+    except Exception as e:
+        logging.warning(f"Critic openai call failed: {e}")
         return ""
 
 
-def _call_gemini(sys_prompt: str, user_prompt: str, temperature: float = 0.2, max_tokens: int = 256) -> str:
+def _call_gemini(sys_prompt: str, user_prompt: str, temperature: float = 0.5, max_tokens: int = 256) -> str:
     try:
         client = get_gem_client()
         resp = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-2.5-flash", # Fallback mapping caught by your shim
             contents=[f"SYSTEM:\n{sys_prompt}\n\nUSER:\n{user_prompt}\n"],
             config={"temperature": temperature, "max_output_tokens": max_tokens},
         )
@@ -542,13 +572,13 @@ def evaluate_sufficiency(
                 sys_id,
                 user_prompt,
                 temperature=CRITIC_OPENAI_TEMPERATURE,
-                max_tokens=32,
+                max_tokens=60, # Increased max_tokens slightly to accommodate JSON schema
             )
             g = _call_gemini(
                 sys_id,
                 user_prompt,
                 temperature=CRITIC_GEMINI_TEMPERATURE,
-                max_tokens=48,
+                max_tokens=60,
             )
 
             for agent, txt in (("openai", o), ("gemini", g)):
