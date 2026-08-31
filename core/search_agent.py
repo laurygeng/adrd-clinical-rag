@@ -1,20 +1,11 @@
 #!/usr/bin/env python3
 """
-Search Agent
-Role: Generates a single targeted web search query based on missing information
-and retrieves external evidence using configured free backends.
+Search Agent (Free & Medical-Focused: EuropePMC + DuckDuckGo)
+Role: Generates a targeted medical search query based on missing info and original question,
+and retrieves external evidence using completely free backends (EuropePMC medical database + DuckDuckGo).
 
 This module returns STRUCTURED evidence items:
   {"source": str, "title": str, "url": str, "text": str}
-
-Backends:
-- Exa (requires EXA_API_KEY)
-- EuropePMC (free)
-- Tavily (requires TAVILY_API_KEY)
-- Optional fallback: local retriever (if all web backends fail)
-
-Note:
-We intentionally keep snippets short to reduce noise and to make Court auditing easier.
 """
 
 import os
@@ -22,6 +13,13 @@ import re
 import requests
 from typing import List, Dict, Tuple
 from openai import OpenAI
+
+# Try importing duckduckgo_search if available
+try:
+    from duckduckgo_search import DDGS
+    HAS_DDGS = True
+except ImportError:
+    HAS_DDGS = False
 
 UA = {"User-Agent": "adrd-medical-rag/2.0"}
 
@@ -62,14 +60,15 @@ def clean_search_query_text(text: str, fallback: str = "") -> str:
     return cleaned
 
 
-def _generate_query(client: OpenAI, target_info: str, model: str = "gpt-4o-mini") -> str:
-    """Generate a single precise search query based on the target missing information."""
+def _generate_query(client: OpenAI, target_info: str, question: str = "", model: str = "gpt-4o-mini") -> str:
+    """Generate a precise medical search query combining question context and target info."""
     prompt = (
-        "Given a piece of missing medical information, a question, or a claim, "
-        "output ONE concise web search query to find direct evidence or answers. "
-        "Keep it Google-friendly (natural language or 3-6 keywords). "
-        "Output ONLY the query text, with no quotes or preamble.\n\n"
-        f"Target Info: {target_info}\nQuery:"
+        "You are a medical research assistant. Given a target missing fact and the original question, "
+        "generate ONE highly specific, concise medical search query (3-6 keywords) focused on Alzheimer's Disease, "
+        "dementia care guidelines, or clinical facts.\n"
+        "Output ONLY the query text, with no quotes, markdown, or preamble.\n\n"
+        f"Original Question: {question}\n"
+        f"Missing Target Info: {target_info}\nQuery:"
     )
     try:
         r = client.chat.completions.create(
@@ -81,52 +80,36 @@ def _generate_query(client: OpenAI, target_info: str, model: str = "gpt-4o-mini"
         q = clean_search_query_text(r.choices[0].message.content or "", fallback=target_info)
         return q if q else clean_search_query_text(target_info, fallback=target_info)
     except Exception:
-        # Fallback to raw target_info if query generation fails
         return clean_search_query_text(target_info, fallback=target_info)
 
 
-def _exa(query: str, n: int = 3) -> List[Dict[str, str]]:
-    """Exa backend (requires EXA_API_KEY). Returns structured evidence items."""
-    key = os.environ.get("EXA_API_KEY")
-    if not key:
-        return []
-
+def _refine_evidence_text(client: OpenAI, query: str, raw_text: str) -> str:
+    """Knowledge Refinement: Extract only the sentences relevant to the medical query, stripping noise."""
+    if not raw_text or len(raw_text) < 20:
+        return ""
+    prompt = (
+        f"Extract and summarize ONLY the specific clinical or caregiving facts from the text below that directly answer or verify: '{query}'. "
+        "Discard unrelated chit-chat, website navigation, or boilerplate text. Keep it under 3 concise sentences.\n\n"
+        f"Text:\n{raw_text[:1000]}\n\nExtracted Facts:"
+    )
     try:
-        payload = {
-            "query": query,
-            "numResults": n,
-            "contents": {"text": {"maxCharacters": 800}},
-        }
-        headers = {"x-api-key": key, "Content-Type": "application/json", **UA}
-        d = requests.post(
-            "https://api.exa.ai/search",
-            headers=headers,
-            json=payload,
-            timeout=30,
-        ).json()
-
-        out: List[Dict[str, str]] = []
-        for x in d.get("results", []) or []:
-            text = (x.get("text") or "").strip()
-            if not text:
-                continue
-            out.append(
-                {
-                    "source": "exa",
-                    "title": (x.get("title") or "").strip(),
-                    "url": (x.get("url") or "").strip(),
-                    "text": text[:800],
-                }
-            )
-        return out
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.0,
+            max_tokens=100,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return (r.choices[0].message.content or "").strip()
     except Exception:
-        return []
+        return raw_text[:400]
 
 
 def _europepmc(query: str, n: int = 3) -> List[Dict[str, str]]:
-    """EuropePMC backend (free). Returns structured evidence items."""
+    """EuropePMC backend (Free medical literature database - PubMed abstracts)."""
     try:
-        params = {"query": query, "format": "json", "pageSize": n, "resultType": "core"}
+        # Append Alzheimer's/dementia context if not present to keep medical focus
+        med_query = query if "dementia" in query.lower() or "alzheimer" in query.lower() else f"{query} dementia"
+        params = {"query": med_query, "format": "json", "pageSize": n, "resultType": "core"}
         d = requests.get(
             "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
             params=params,
@@ -140,12 +123,9 @@ def _europepmc(query: str, n: int = 3) -> List[Dict[str, str]]:
             text = x.get("abstractText") or x.get("title") or ""
             text = re.sub(r"<[^>]+>", " ", text).strip()
 
-            # Best-effort URL construction
             src = (x.get("source") or "").strip()
             pid = (x.get("id") or "").strip()
-            url = ""
-            if src and pid:
-                url = f"https://europepmc.org/article/{src}/{pid}"
+            url = f"https://europepmc.org/article/{src}/{pid}" if src and pid else ""
 
             if text:
                 out.append(
@@ -161,67 +141,40 @@ def _europepmc(query: str, n: int = 3) -> List[Dict[str, str]]:
         return []
 
 
-def _tavily(query: str, n: int = 4) -> List[Dict[str, str]]:
-    """Tavily backend (requires TAVILY_API_KEY). Returns structured evidence items."""
-    key = os.environ.get("TAVILY_API_KEY")
-    if not key:
+def _duckduckgo(query: str, n: int = 3) -> List[Dict[str, str]]:
+    """DuckDuckGo free search backend (No API key required)."""
+    if not HAS_DDGS:
         return []
-
+    out = []
     try:
-        payload = {
-            "api_key": key,
-            "query": query,
-            "search_depth": "advanced",
-            "max_results": n,
-            "include_answer": True,
-        }
-        d = requests.post(
-            "https://api.tavily.com/search",
-            json=payload,
-            headers=UA,
-            timeout=40,
-        ).json()
-
-        out: List[Dict[str, str]] = []
-
-        ans = (d.get("answer") or "").strip()
-        if ans:
-            out.append(
-                {
-                    "source": "tavily",
-                    "title": "tavily_answer",
-                    "url": "",
-                    "text": ans[:800],
-                }
-            )
-
-        for x in d.get("results", []) or []:
-            text = (x.get("content") or "").strip()
-            if not text:
-                continue
-            out.append(
-                {
-                    "source": "tavily",
-                    "title": (x.get("title") or "").strip(),
-                    "url": (x.get("url") or "").strip(),
-                    "text": text[:800],
-                }
-            )
-
-        return out
+        with DDGS() as ddgs:
+            results = [r for r in ddgs.text(query, max_results=n)]
+            for res in results:
+                body = (res.get("body") or "").strip()
+                if not body:
+                    continue
+                out.append(
+                    {
+                        "source": "duckduckgo",
+                        "title": (res.get("title") or "").strip(),
+                        "url": (res.get("href") or "").strip(),
+                        "text": body[:800],
+                    }
+                )
     except Exception:
-        return []
+        pass
+    return out
 
 
 def _local_fallback(query: str, retriever) -> List[Dict[str, str]]:
-    """Optional fallback to local retriever when web backends return nothing."""
+    """Local retriever fallback if web searches return nothing."""
     if retriever is None:
         return []
     try:
         wp, _, _ = retriever.get_retrieved_passages(
             query,
-            top_k=4,
-            pre_k=15,
+            top_k=6,
+            pre_k=20,
             window_size=500,
         )
         out: List[Dict[str, str]] = []
@@ -241,31 +194,39 @@ def _local_fallback(query: str, retriever) -> List[Dict[str, str]]:
         return []
 
 
-def _gather(query: str, retriever) -> List[Dict[str, str]]:
-    """Collect evidence for the query across configured backends."""
-    ev: List[Dict[str, str]] = []
-    ev.extend(_exa(query, 3))
-    ev.extend(_europepmc(query, 3))
-
-    if not ev:
-        ev.extend(_tavily(query, 4))
-
-    if not ev:
-        ev.extend(_local_fallback(query, retriever))
-
-    return ev
-
-
-def research(client: OpenAI, target_info: str, retriever=None) -> Tuple[List[Dict[str, str]], str]:
+def research(client: OpenAI, target_info: str, question: str = "", retriever=None) -> Tuple[List[Dict[str, str]], str]:
     """
-    Execute a single-direction web search.
+    Execute a free, medical-focused external search (EuropePMC -> DuckDuckGo -> Local Fallback)
+    with query contextualization and LLM-based evidence refinement.
 
     Returns:
       (evidence_items, search_query_used)
-
-    evidence_items is a list of dicts with keys:
-      source, title, url, text
     """
-    query = _generate_query(client, target_info)
-    evidence = _gather(query, retriever)
-    return evidence, query
+    query = _generate_query(client, target_info, question=question)
+    
+    # 1. Prioritize EuropePMC for authoritative medical literature/guidelines
+    ev: List[Dict[str, str]] = []
+    ev.extend(_europepmc(query, 3))
+
+    # 2. Fallback to DuckDuckGo general free search if literature yields little
+    if not ev:
+        ev.extend(_duckduckgo(query, 3))
+
+    # 3. Final fallback to local retrieval
+    if not ev:
+        ev.extend(_local_fallback(query, retriever))
+
+    # 4. Refine evidence: strip noise and extract pure clinical facts using LLM
+    refined_evidence: List[Dict[str, str]] = []
+    for item in ev:
+        raw_txt = item.get("text", "")
+        refined_txt = _refine_evidence_text(client, query, raw_txt)
+        if refined_txt:
+            refined_evidence.append({
+                "source": item.get("source", "web"),
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "text": refined_txt,
+            })
+
+    return refined_evidence if refined_evidence else ev, query

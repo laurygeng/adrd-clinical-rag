@@ -44,9 +44,8 @@ _oai_client: Optional[OpenAI] = None
 _gem_client = None
 
 CRITIC_CALLS_PER_AGENT = int(os.environ.get("CRITIC_CALLS_PER_AGENT", "3"))
-# [MODIFIED] Increased default temperature from 0.0 to 0.5 to enable true multi-path sampling for consensus
-CRITIC_OPENAI_TEMPERATURE = float(os.environ.get("CRITIC_OPENAI_TEMPERATURE", "0.5"))
-CRITIC_GEMINI_TEMPERATURE = float(os.environ.get("CRITIC_GEMINI_TEMPERATURE", "0.5"))
+CRITIC_OPENAI_TEMPERATURE = float(os.environ.get("CRITIC_OPENAI_TEMPERATURE", "0.3"))
+CRITIC_GEMINI_TEMPERATURE = float(os.environ.get("CRITIC_GEMINI_TEMPERATURE", "0.3"))
 
 
 # ----------------------------
@@ -77,16 +76,21 @@ def get_gem_client():
 # ----------------------------
 # Prompts
 # ----------------------------
-# [MODIFIED] Enforce strict JSON output to prevent 7B/8B models from breaking format
 _CRITIC_FORMAT_RULES = (
-    "You MUST output your answer strictly as a valid JSON object. Do not include any other text, explanation, or markdown formatting.\n"
+    "You MUST output your answer strictly as a valid JSON object with NO extra text, comments, or markdown.\n"
     "{\n"
-    '  "sufficient": true or false,\n'
-    '  "gap": "NONE" or "<a single short missing fact phrase>"\n'
+    '  "sufficient": true,\n'
+    '  "gap": "NONE"\n'
     "}\n"
-    "Rules: Do NOT answer the original question. Do NOT repeat the context. "
-    "If the context is sufficient, output true and NONE. "
-    "If the context is insufficient, output false and a gap of at most 12 words."
+    "OR\n"
+    "{\n"
+    '  "sufficient": false,\n'
+    '  "gap": "<short missing fact phrase>"\n'
+    "}\n"
+    "CRITICAL RULES:\n"
+    "1. Do NOT solve the question. Do NOT mention any option letters (A, B, C, D, E).\n"
+    "2. The 'gap' must be a short medical fact phrase (at most 10 words), NEVER an option name like 'Option D'.\n"
+    "3. If the exact direct fact is missing from the context, set sufficient to false."
 )
 
 SYS_ID_MC = (
@@ -109,7 +113,7 @@ SYS_ID_QA = (
 
 
 # ----------------------------
-# Helpers
+# Helpers & Guardrails
 # ----------------------------
 def _is_empty(x: str) -> bool:
     return (x is None) or (not str(x).strip())
@@ -117,6 +121,25 @@ def _is_empty(x: str) -> bool:
 
 def _is_none_strict(x: str) -> bool:
     return str(x).strip().upper() == "NONE"
+
+
+def _clean_and_validate_gap(raw_gap: str) -> str:
+    """[GUARDRAIL]: 清洗与校验小模型产生的 gap，防止 Option D 或长篇废话污染检索"""
+    gap = str(raw_gap or "").strip().strip("`\"'")
+    gap = re.sub(r"\s+", " ", gap)
+    
+    if not gap or gap.upper() == "NONE":
+        return "NONE"
+        
+    # 1. 如果包含选项字眼或单独的选项字母（如 Option D, A, B 等），直接判定为无效
+    if re.search(r"(?i)\boption\b", gap) or re.fullmatch(r"[A-E]", gap):
+        return "NONE"
+        
+    # 2. 如果包含大段解释性废话或超长文本，截断或降级
+    if len(gap) > 100 or len(gap.split()) > 12:
+        return "NONE"
+        
+    return gap
 
 
 def _parse_critic_response(x: str) -> Dict[str, Any]:
@@ -131,10 +154,9 @@ def _parse_critic_response(x: str) -> Dict[str, Any]:
     if not raw:
         return parsed
 
-    # [MODIFIED] 1. Try to parse as JSON first (Best for Llama-3/Med-7B)
+    # 1. Try to parse as JSON first (Best for Llama-3/Med-7B)
     json_str = re.sub(r"```json|```", "", raw).strip()
     try:
-        # Extract everything between { and } to ignore leading/trailing model chatter
         match = re.search(r"\{.*\}", json_str, re.DOTALL)
         if match:
             json_str = match.group(0)
@@ -142,19 +164,19 @@ def _parse_critic_response(x: str) -> Dict[str, Any]:
         data = json.loads(json_str)
         if "sufficient" in data:
             parsed["sufficient"] = bool(data["sufficient"])
-            parsed["gap"] = str(data.get("gap", "NONE")).strip()
+            raw_gap = str(data.get("gap", "NONE"))
+            parsed["gap"] = _clean_and_validate_gap(raw_gap)
             parsed["used_structured"] = True
             
-            gap_upper = parsed["gap"].upper()
-            if parsed["sufficient"] is True or gap_upper == "NONE" or not parsed["gap"]:
+            if parsed["sufficient"] is True or parsed["gap"] == "NONE":
                 parsed["normalized_gap"] = "NONE"
             else:
-                parsed["normalized_gap"] = parsed["gap"][:180].strip()
+                parsed["normalized_gap"] = parsed["gap"]
             return parsed
     except Exception:
-        pass # Fallback to regex if JSON parsing fails entirely
+        pass 
 
-    # 2. Fallback to regex extraction (Legacy support)
+    # 2. Fallback to regex extraction
     sufficient_match = re.search(r"(?im)^\s*sufficient\s*:\s*(yes|no|true|false)\b", raw)
     gap_match = re.search(r"(?im)^\s*gap\s*:\s*(.+)$", raw)
     if sufficient_match:
@@ -163,22 +185,17 @@ def _parse_critic_response(x: str) -> Dict[str, Any]:
         parsed["sufficient"] = sufficient_token in {"YES", "TRUE"}
     if gap_match:
         parsed["used_structured"] = True
-        parsed["gap"] = gap_match.group(1).strip()
+        parsed["gap"] = _clean_and_validate_gap(gap_match.group(1).strip())
 
     if parsed["used_structured"]:
-        gap = str(parsed["gap"] or "").strip().strip("`\"'")
-        gap = re.sub(r"\s+", " ", gap)
-        if parsed["sufficient"] is True or gap.upper() == "NONE":
+        if parsed["sufficient"] is True or parsed["gap"] == "NONE":
             parsed["normalized_gap"] = "NONE"
         else:
-            parsed["normalized_gap"] = gap[:180].strip().rstrip(" .,:;-")
+            parsed["normalized_gap"] = parsed["gap"]
         return parsed
 
     upper = raw.upper()
     if upper == "NONE":
-        parsed["normalized_gap"] = "NONE"
-        return parsed
-    if "CONTEXT ALREADY CONTAINS EVERYTHING NEEDED" in upper:
         parsed["normalized_gap"] = "NONE"
         return parsed
 
@@ -194,83 +211,15 @@ def _normalize_gap_text(x: str) -> str:
     if parsed.get("normalized_gap"):
         return str(parsed["normalized_gap"])
 
-    t = t.replace("\r\n", "\n")
-    t = re.sub(r"```.*?```", " ", t, flags=re.S)
-    t = re.sub(r"\s+", " ", t).strip()
-
-    if t.upper() == "NONE":
-        return "NONE"
-
-    if re.search(r"(?is)\b(system|user|assistant|context|question|statement|answer|explanation)\s*:", t):
-        return ""
-
-    patterns = [
-        r"(?is).*?single most important piece of information still missing(?: from the context)?(?: needed to [^:]+)?\s*(?:is|:)\s*",
-        r"(?is).*?most important piece of information missing(?: from the context)?(?: needed to [^:]+)?\s*(?:is|:)\s*",
-        r"(?is).*?missing information(?: from the context)?(?: needed to [^:]+)?\s*(?:is|:)\s*",
-        r"(?is).*?the answer is\s*:\s*",
-    ]
-    for pat in patterns:
-        stripped = re.sub(pat, "", t).strip()
-        if stripped != t:
-            t = stripped
-            break
-
-    t = re.sub(r"(?is)^answer\s*:\s*(yes|no|true|false)\b", "", t).strip()
-    t = re.sub(r"(?is)^explanation\s*:\s*", "", t).strip()
-    t = re.sub(r"(?is)^because\b.*$", "", t).strip()
-    t = re.sub(r"(?is)\bwithout this information.*$", "", t).strip()
-    t = re.sub(r"(?is)\bthe context provided does not contain information about\b", "", t).strip()
-    t = re.sub(r"(?is)\bthe context does not contain information about\b", "", t).strip()
-    t = re.sub(r"(?is)\bthe context does not provide\b", "", t).strip()
-    t = re.sub(r"(?is)\bto confidently decide.*$", "", t).strip()
-    t = re.sub(r"(?is)\bto determine .*?\bis\b", "", t).strip()
-
-    line_candidates: List[str] = []
-    for raw_line in str(x or "").replace("\r\n", "\n").splitlines():
-        line = raw_line.strip().strip("-*•`\"'")
-        if not line:
-            continue
-        lower = line.lower()
-        if lower in {"yes", "no", "true", "false", "none"}:
-            continue
-        if any(token in lower for token in ["context:", "question:", "statement:", "answer:", "explanation:", "system:", "user:", "assistant:"]):
-            continue
-        if "single most important piece of information" in lower or "missing information" in lower:
-            norm = _normalize_gap_text(line)
-            if norm and norm != "NONE":
-                line_candidates.append(norm)
-            continue
-        line_candidates.append(line)
-
-    if line_candidates:
-        ranked = sorted(
-            line_candidates,
-            key=lambda s: (
-                any(ch.isdigit() for ch in s),
-                any(k in s.lower() for k in ["risk", "rate", "prevalence", "percent", "percentage", "age", "guideline", "definition"]),
-                -len(s),
-            ),
-            reverse=True,
-        )
-        t = ranked[0]
-
-    t = re.split(r"(?<=[.;!?])\s+(?:because|without|therefore|so that|which means|this means)\b", t, maxsplit=1, flags=re.I)[0]
-    t = re.split(r"\b(?:because|without|therefore|so that|which means|this means)\b", t, maxsplit=1, flags=re.I)[0]
-    t = re.sub(r"\s+", " ", t).strip().strip("\"'")
-    t = t.rstrip(" .,:;-")
-    return t[:180].strip()
+    cleaned = _clean_and_validate_gap(t)
+    return cleaned
 
 
 def _is_valid_gap(x: str) -> bool:
     t = _normalize_gap_text(x)
-    if not t:
+    if not t or t == "NONE":
         return False
-    if t == "NONE":
-        return False
-    if len(t) < 3:
-        return False
-    if len(t) > 180:
+    if len(t) < 3 or len(t) > 120:
         return False
     if len(t.split()) > 12:
         return False
@@ -322,8 +271,6 @@ def _looks_like_direct_answer(x: str, q_type: str, question: str) -> bool:
         normalized_options = {v.lower() for v in _extract_mc_options(question).values() if v}
         if lower_t in normalized_options:
             return True
-        if any(lower_t == f"{k.lower()}. {v.lower()}" for k, v in _extract_mc_options(question).items()):
-            return True
 
     return False
 
@@ -331,18 +278,9 @@ def _looks_like_direct_answer(x: str, q_type: str, question: str) -> bool:
 def _gap_is_negative(gap: str) -> bool:
     g = (gap or "").strip().lower()
     neg_markers = [
-        "does not state",
-        "doesn't state",
-        "not stated",
-        "not mentioned",
-        "not explicitly",
-        "isn't mentioned",
-        "is not mentioned",
-        "lacks",
-        "lack of",
-        "missing:",
-        "context does not",
-        "the context does not",
+        "does not state", "doesn't state", "not stated", "not mentioned", 
+        "not explicitly", "isn't mentioned", "is not mentioned", "lacks", 
+        "lack of", "missing:", "context does not", "the context does not",
     ]
     return any(m in g for m in neg_markers)
 
@@ -350,18 +288,18 @@ def _gap_is_negative(gap: str) -> bool:
 # ----------------------------
 # Model calls: Identify
 # ----------------------------
-def _call_openai(sys_prompt: str, user_prompt: str, temperature: float = 0.5, max_tokens: int = 40) -> str:
+def _call_openai(sys_prompt: str, user_prompt: str, temperature: float = 0.3, max_tokens: int = 40) -> str:
     try:
         c = get_oai_client()
         r = c.chat.completions.create(
-            model="gpt-4o",  # Fallback mapping caught by your shim
+            model="gpt-4o",
             temperature=temperature,
             max_tokens=max_tokens,
             messages=[
                 {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            response_format={"type": "json_object"} # optional hint if your shim supports it
+            response_format={"type": "json_object"}
         )
         return (r.choices[0].message.content or "").strip()
     except Exception as e:
@@ -369,17 +307,15 @@ def _call_openai(sys_prompt: str, user_prompt: str, temperature: float = 0.5, ma
         return ""
 
 
-def _call_gemini(sys_prompt: str, user_prompt: str, temperature: float = 0.5, max_tokens: int = 256) -> str:
+def _call_gemini(sys_prompt: str, user_prompt: str, temperature: float = 0.3, max_tokens: int = 120) -> str:
     try:
         client = get_gem_client()
         resp = client.models.generate_content(
-            model="gemini-2.5-flash", # Fallback mapping caught by your shim
+            model="gemini-2.5-flash",
             contents=[f"SYSTEM:\n{sys_prompt}\n\nUSER:\n{user_prompt}\n"],
             config={"temperature": temperature, "max_output_tokens": max_tokens},
         )
         txt = getattr(resp, "text", "") or ""
-        if not str(txt).strip():
-            logging.warning("Critic gemini call returned empty output.")
         return str(txt).strip()
     except Exception as e:
         logging.warning(f"Critic gemini call failed: {e}")
@@ -424,7 +360,7 @@ def _verify_locate_with_reranker(
     context: str,
     window_sents: int = 2,
     max_spans: int = 120,
-    threshold: float = 0.55,
+    threshold: float = 0.45,
 ) -> Dict[str, Any]:
     spans = _make_sentence_windows(context, window_sents=window_sents, max_spans=max_spans)
     if not spans or retriever is None:
@@ -501,7 +437,7 @@ def evaluate_sufficiency(
     calls_per_agent: int = CRITIC_CALLS_PER_AGENT,
     question_id: str = None,
     retriever=None,
-    verify_threshold: float = 0.55,
+    verify_threshold: float = 0.35,
     verify_window_sents: int = 2,
     verify_max_spans: int = 120,
 ) -> Tuple[bool, str, Dict[str, Any]]:
@@ -528,7 +464,6 @@ def evaluate_sufficiency(
         "consensus_gap_is_negative": False,
         "consensus_debug": {},
 
-        # Gap VerifyLocate
         "verify_mode": "",
         "verify_label": "SKIPPED",
         "verify_best_score": None,
@@ -548,7 +483,6 @@ def evaluate_sufficiency(
         if retriever is None:
             raise ValueError("evaluate_sufficiency requires retriever for VerifyLocate scoring.")
 
-        # Identify stage
         if q_type_u == "MC":
             sys_id = SYS_ID_MC
             user_prompt = f"Context:\n{context}\n\nQuestion:\n{question}"
@@ -572,7 +506,7 @@ def evaluate_sufficiency(
                 sys_id,
                 user_prompt,
                 temperature=CRITIC_OPENAI_TEMPERATURE,
-                max_tokens=60, # Increased max_tokens slightly to accommodate JSON schema
+                max_tokens=50,
             )
             g = _call_gemini(
                 sys_id,
@@ -586,10 +520,11 @@ def evaluate_sufficiency(
                 parsed = _parse_critic_response(txt)
                 normalized = _normalize_gap_text(txt)
                 direct_answer = _looks_like_direct_answer(normalized or txt, q_type_u, question)
+                
                 if _is_empty(txt):
                     label = "EMPTY"
                     empty_count += 1
-                elif parsed.get("sufficient") is True or _is_none_strict(normalized or txt):
+                elif parsed.get("sufficient") is True or _is_none_strict(normalized or txt) or normalized == "NONE":
                     label = "NONE"
                     none_count_strict += 1
                 else:
@@ -619,7 +554,6 @@ def evaluate_sufficiency(
         trace["valid_gaps"] = valid_gaps
         trace["invalid_gaps"] = invalid_gaps
 
-        # 统一 Early Exit: 只要 Strict NONE 占比较高，不论什么题型都直接放行
         if trace["none_frac_strict"] >= 0.6:
             trace["final_is_sufficient"] = True
             trace["final_missing_info"] = ""
@@ -637,7 +571,6 @@ def evaluate_sufficiency(
             write_jsonl("critic", "critic_traces.jsonl", trace)
             return True, "", trace
 
-        # Consensus gap
         consensus_gap = ""
         if valid_gaps:
             emb = get_emb_model()
@@ -672,7 +605,6 @@ def evaluate_sufficiency(
                 "n_invalid_gaps": len(invalid_gaps),
             }
 
-        # Gap VerifyLocate
         gap_missing = False
         if consensus_gap:
             trace["verify_mode"] = "locate_reranker"
@@ -699,7 +631,6 @@ def evaluate_sufficiency(
                 trace["consensus_debug"]["verify_decision"] = "ABSENT->INSUFFICIENT"
                 gap_missing = True
 
-        # Final decision (统一走 Gap 判定)
         if consensus_gap and gap_missing:
             trace["final_is_sufficient"] = False
             trace["final_missing_info"] = consensus_gap
