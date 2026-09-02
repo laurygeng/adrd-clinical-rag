@@ -107,11 +107,16 @@ def generate_web_rewrite_query(statement: str, gap_hint: str = "") -> str:
         
     client = get_oai_client()
     sys_prompt = "You are an expert medical search query generator. Output a concise search query (3-7 keywords)."
+    
+    # [MODIFIED]: 泛化 Query 提取提示词，避免带入具体的负面断言/误区动作
     user_prompt = (
         f"Question: {clean_statement}\n"
         f"Missing Fact to Find: {gh}\n\n"
-        "Generate a short, precise search query combining the core question subject and the missing fact. "
-        "Do NOT include option letters (A, B, C, D, E) or option texts. "
+        "Generate a short, precise search query (3-7 keywords). "
+        "CRITICAL RULE: Extract the broad medical concept, intervention, or clinical topic. "
+        "Do NOT include the specific assertions, restrictive behaviors, or exact claims made in the question, "
+        "as those may be the 'myths' or 'false statements' being tested. Formulate the query to find the general factual baseline or standard best practices for the topic.\n"
+        "Do NOT include option letters (A, B, C, D, E). "
         "Output ONLY the query text without quotes or preamble."
     )
     
@@ -233,19 +238,13 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "", use_r
         trace_log["is_sufficient"] = True
     trace_log["time_critic_evaluation"] = time.time() - t0
 
-# STEP 3-5: Unified Completion Routing (Time tracking and ablation control)
+    # STEP 3-5: Unified Completion Routing (Time tracking and ablation control)
     final_context = base_context
     critic_verify_label = (trace_log.get("critic_verify_label") or "").strip().upper()
     consensus_gap_is_negative = bool(trace_log.get("critic_consensus_gap_is_negative"))
 
-    # 获取 VerifyLocate 的最高匹配分数
-    verify_score = trace_log.get("critic_verify_best_score")
-    
-    # 只有当分数真正很低（例如 < 0.30，说明本地完全找不到相关支撑句）时，才允许触发外网/多跳补全
-    is_truly_absent = (verify_score is not None and verify_score < 0.30)
-
-    # Only trigger completion if completion is enabled and critic deemed it necessary
-    should_complete = use_completion and (not is_sufficient) and (critic_verify_label == "ABSENT") and is_truly_absent and (not consensus_gap_is_negative)
+    # [PAPER-READY UNIFIED ROUTING]: 恢复全量统一触发，不针对题型做特判
+    should_complete = use_completion and (not is_sufficient) and (critic_verify_label == "ABSENT") and (not consensus_gap_is_negative)
     
     t0 = time.time()
     if should_complete:
@@ -253,11 +252,9 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "", use_r
         trace_log["completion_reason"] = "critic_insufficient_and_absent"
 
         logging.info("Step 3: Triggering Completion Retrieval with Hybrid Question-Gap Query...")
-        # [UPGRADED]: 传入原问题和提取的缺口，组合出高精度的复合检索 Query
         completion_query = generate_web_rewrite_query(statement=question, gap_hint=trace_log.get('missing_info', ''))
         trace_log["web_query_used"] = completion_query
         
-        # 带着复合 Query 去本地知识库进行二次检索
         gap_passages, _, _ = retriever.get_retrieved_passages(
             completion_query,
             top_k=5,
@@ -266,29 +263,37 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "", use_r
         )
         
         base_tagged = [f"[BASE] {p}" for p in base_passages[:3]]
-        gap_tagged = [f"[GAP] {p}" for p in gap_passages]
+        gap_tagged = [f"[GAP] {p}" for p in gap_passages[:3]]
 
         web_passages_trimmed = []
         try:
-            web_evidence, web_query = research(
+            # [MODIFIED]: 接收第三个参数 search_log_md 
+            web_evidence, web_query, search_log_md = research(
                 client=client,
                 target_info=completion_query,
                 question=question,
                 retriever=retriever,
             )
+            
+            # --- 新增：把外网搜索日志追加到 MD 文件中 ---
+            md_path = trace_log.get("critic_md_path")
+            if md_path and os.path.exists(md_path):
+                with open(md_path, "a", encoding="utf-8") as f:
+                    f.write(search_log_md)
+            # ---------------------------------------------
+            
             web_passages = format_evidence_items(web_evidence)
             web_passages_trimmed = web_passages[:1]  # 仅保留高质量的 1 段外网文本
         except Exception as e:
             logging.warning(f"Web retrieval failed: {e}. Proceeding with local gap passages only.")
 
-      # [UNIFIED REFINEMENT]: 统一架构下的精简补全组合，严格控制上下文噪音上限
-        prioritized_passages = base_tagged + web_passages_trimmed + gap_tagged
+        # 采用高精度证据前置排列与长度自适应截断，平衡补全收益与抗噪能力
+        prioritized_passages = gap_tagged + web_passages_trimmed + base_tagged
         merged_passages = deduplicate_passages(prioritized_passages)
         
-        # 统一通过 q_type 动态调整最大字符数和最大片段数（保持架构一致的前提下自适应精度）
         is_tf = (q_type.strip().upper() == "TF")
-        MAX_CONTEXT_CHARS = 6000 if is_tf else 12000
-        max_sources = 3 if is_tf else 6
+        MAX_CONTEXT_CHARS = 8000 if is_tf else 12000
+        max_sources = 4 if is_tf else 6
         
         current_chars = 0
         final_passages = []

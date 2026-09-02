@@ -188,12 +188,15 @@ def generate_final_answer(client, question: str, context: str, q_type: str, mode
     target_max_tokens = 10
 
     if q_type == "TF":
-        # [Modified] Tightened the decision rule to strictly prevent model hallucination or over-inference.
+        # [OPTIMIZED TF PROMPT]: Enhanced with reasoning rules for general principles vs exceptions,
+        # absolute language & double negatives, and categorization (subset vs whole).
         strict_instruction += (
             "2. FORMAT: Output ONLY the final answer, with no explanation, preamble, or extra text.\n"
-            "3. DECISION RULE: Answer 'Yes' ONLY IF the context explicitly and directly confirms the statement. "
-            "Answer 'No' if the context contradicts it, lacks direct confirmation, or is ambiguous. Do not infer.\n"
-            "4. Your output must be EXACTLY 'Yes' or 'No'."
+            "3. CRITICAL RULES FOR LOGICAL REASONING:\n"
+            "   - **General Principles vs. Exceptions:** These statements often represent general caregiving rules of thumb. If the context broadly supports the core principle of the statement, evaluate it as 'Yes'. Do NOT rate it 'No' merely because the context mentions rare medical exceptions, specific drug dosages, or uses cautious academic hedging (e.g., 'insufficient evidence').\n"
+            "   - **Absolute Language & Double Negatives:** Scrutinize absolute terms ('always', 'cannot', 'only', 'no other'). If a statement claims 'There is no other explanation for X', and the context lists multiple causes for X, the statement is 'No' (False).\n"
+            "   - **Categorization & Definitions:** If the statement claims 'A is B', but the context states 'A includes B, C, and D', then the statement is 'No' (confusing a subset with the whole).\n"
+            "4. DECISION: Based on the above rules, your output must be EXACTLY 'Yes' or 'No'."
         )
     elif q_type == "MC":
         strict_instruction += (

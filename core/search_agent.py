@@ -62,14 +62,19 @@ def clean_search_query_text(text: str, fallback: str = "") -> str:
 
 def _generate_query(client: OpenAI, target_info: str, question: str = "", model: str = "gpt-4o-mini") -> str:
     """Generate a precise medical search query combining question context and target info."""
+    
+    # [MODIFIED]: 泛化检索意图，屏蔽题目中过分具体的（甚至可能是错误的）行为约束
     prompt = (
         "You are a medical research assistant. Given a target missing fact and the original question, "
         "generate ONE highly specific, concise medical search query (3-6 keywords) focused on Alzheimer's Disease, "
         "dementia care guidelines, or clinical facts.\n"
+        "IMPORTANT: Focus the query on the core medical entity or general topic to retrieve standard facts or best practices. "
+        "Ignore the specific behavioral claims or rigid constraints from the question, as they might be false premises/myths.\n"
         "Output ONLY the query text, with no quotes, markdown, or preamble.\n\n"
         f"Original Question: {question}\n"
         f"Missing Target Info: {target_info}\nQuery:"
     )
+    
     try:
         r = client.chat.completions.create(
             model=model,
@@ -194,39 +199,68 @@ def _local_fallback(query: str, retriever) -> List[Dict[str, str]]:
         return []
 
 
-def research(client: OpenAI, target_info: str, question: str = "", retriever=None) -> Tuple[List[Dict[str, str]], str]:
+def research(client: OpenAI, target_info: str, question: str = "", retriever=None) -> Tuple[List[Dict[str, str]], str, str]:
     """
     Execute a free, medical-focused external search (EuropePMC -> DuckDuckGo -> Local Fallback)
     with query contextualization and LLM-based evidence refinement.
 
     Returns:
-      (evidence_items, search_query_used)
+      (evidence_items, search_query_used, search_log_markdown)
     """
-    query = _generate_query(client, target_info, question=question)
+    log_lines = ["\n## Completion Retrieval (Web Search) Log\n"]
     
-    # 1. Prioritize EuropePMC for authoritative medical literature/guidelines
+    query = _generate_query(client, target_info, question=question)
+    log_lines.append(f"- **Generated Search Query**: `{query}`")
+
     ev: List[Dict[str, str]] = []
-    ev.extend(_europepmc(query, 3))
+    
+    # 1. 优先 EuropePMC 
+    epmc = _europepmc(query, 3)
+    if epmc:
+        log_lines.append(f"- **EuropePMC**: Found {len(epmc)} results.")
+        ev.extend(epmc)
+    else:
+        log_lines.append("- **EuropePMC**: Found 0 results. Falling back to DuckDuckGo...")
 
-    # 2. Fallback to DuckDuckGo general free search if literature yields little
+    # 2. 兜底 DuckDuckGo
     if not ev:
-        ev.extend(_duckduckgo(query, 3))
+        ddg = _duckduckgo(query, 3)
+        if ddg:
+            log_lines.append(f"- **DuckDuckGo**: Found {len(ddg)} results.")
+            ev.extend(ddg)
+        else:
+            log_lines.append("- **DuckDuckGo**: Found 0 results. Falling back to Local Retrieval...")
 
-    # 3. Final fallback to local retrieval
+    # 3. 最终本地兜底
     if not ev:
-        ev.extend(_local_fallback(query, retriever))
+        loc = _local_fallback(query, retriever)
+        if loc:
+            log_lines.append(f"- **Local Fallback**: Found {len(loc)} results.")
+            ev.extend(loc)
+        else:
+            log_lines.append("- **Local Fallback**: Found 0 results.")
 
-    # 4. Refine evidence: strip noise and extract pure clinical facts using LLM
+    # 4. LLM 证据清洗
+    log_lines.append("\n### LLM Evidence Refinement (Noise Filtering)\n")
     refined_evidence: List[Dict[str, str]] = []
-    for item in ev:
+    for i, item in enumerate(ev):
         raw_txt = item.get("text", "")
         refined_txt = _refine_evidence_text(client, query, raw_txt)
+        
+        source = item.get("source", "unknown")
+        title = item.get("title", "No Title")
+        url = item.get("url", "No URL")
+        
         if refined_txt:
             refined_evidence.append({
-                "source": item.get("source", "web"),
-                "title": item.get("title", ""),
-                "url": item.get("url", ""),
-                "text": refined_txt,
+                "source": source, "title": title, "url": url, "text": refined_txt
             })
+            log_lines.append(f"- ✅ **[KEPT]** Item {i+1} | Source: `{source}` | Title: *{title[:50]}...* | URL: {url}")
+        else:
+            log_lines.append(f"- ❌ **[DROPPED]** Item {i+1} | Source: `{source}` | Reason: LLM found no directly relevant facts.")
 
-    return refined_evidence if refined_evidence else ev, query
+    final_ev = refined_evidence if refined_evidence else ev
+    log_lines.append(f"\n- **Final Evidence Count**: Returned {len(final_ev)} item(s) to Orchestrator.\n")
+
+    # 返回这三个变量
+    return final_ev, query, "\n".join(log_lines)
