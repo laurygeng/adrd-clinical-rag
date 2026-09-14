@@ -19,6 +19,8 @@ from datetime import datetime
 from typing import Optional, Set, List, Dict, Any
 
 import pandas as pd
+import traceback
+from core.trace_logger import write_jsonl, write_text
 from tqdm import tqdm
 
 # -----------------------------------------------------------------------------
@@ -106,7 +108,7 @@ def load_json_benchmarks(subset: str = "all", allowed_ids: Optional[Set[int]] = 
     return df
 
 
-def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str], use_rag: bool, use_completion: bool):
+def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str], use_rag: bool, use_completion: bool, checkpoint_every: int = 5):
     allowed_ids = _parse_ids(ids_str)
     df_questions = load_json_benchmarks(subset=subset, allowed_ids=allowed_ids)
     if df_questions.empty:
@@ -160,7 +162,7 @@ def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str], use_rag:
     else:
         print(f"\n🚀 [BENCHMARK MODE] Evaluating {len(remaining_df)} remaining questions (Sequential & Safe)...")
         print(f"🔧 Ablation Settings: Use RAG = {use_rag}, Use Completion = {use_completion}")
-        checkpoint_every = 5
+        checkpoint_every = int(checkpoint_every or 5)
 
         for idx, row in tqdm(remaining_df.iterrows(), total=len(remaining_df), desc="Running Benchmarks"):
             qid = row["Question_ID"]
@@ -196,10 +198,16 @@ def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str], use_rag:
                 t_ans = trace_dict.get("time_answer_generation")
 
             except Exception as e:
-                logging.error(f"Failed on {qid}: {e}")
+                tb = traceback.format_exc()
+                logging.error(f"Failed on {qid}: {e}\n{tb}")
                 generated_answer = f"ERROR: {e}"
                 is_correct = False
                 retrieved_context = f"ERROR: {e}"
+                try:
+                    write_jsonl("diagnostics", "pipeline_errors.jsonl", {"ts": datetime.now().isoformat(timespec="seconds"), "question_id": qid, "error": str(e), "traceback": tb, "question_preview": question_text[:400]})
+                    write_text("diagnostics", f"pipeline_error_{qid}.txt", f"Error: {e}\n\nTrace:\n{tb}\n\nQuestion:\n{question_text}")
+                except Exception:
+                    pass
 
             t_total = time.time() - t_start
 
@@ -239,7 +247,7 @@ def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str], use_rag:
     print(f"✅ Report saved to: {output_csv}\n")
 
 
-def run_inference_mode(csv_path: str, limit: int, use_rag: bool, use_completion: bool):
+def run_inference_mode(csv_path: str, limit: int, use_rag: bool, use_completion: bool, checkpoint_every: int = 5):
     if not os.path.exists(csv_path):
         logging.error(f"Input CSV not found: {csv_path}")
         return
@@ -294,7 +302,7 @@ def run_inference_mode(csv_path: str, limit: int, use_rag: bool, use_completion:
 
     print(f"\n🚀 [INFERENCE MODE] Evaluating {len(remaining_df)} remaining questions from CSV (Sequential & Safe)...")
     print(f"🔧 Ablation Settings: Use RAG = {use_rag}, Use Completion = {use_completion}")
-    checkpoint_every = 5
+    checkpoint_every = int(checkpoint_every or 5)
 
     for idx, row in tqdm(remaining_df.iterrows(), total=len(remaining_df), desc="Running Inference"):
         qid = row["Question_ID"]
@@ -327,9 +335,15 @@ def run_inference_mode(csv_path: str, limit: int, use_rag: bool, use_completion:
             t_ans = trace_dict.get("time_answer_generation")
 
         except Exception as e:
-            logging.error(f"Failed on {qid}: {e}")
+            tb = traceback.format_exc()
+            logging.error(f"Failed on {qid}: {e}\n{tb}")
             generated_answer = f"ERROR: {e}"
             retrieved_context = f"ERROR: {e}"
+            try:
+                write_jsonl("diagnostics", "pipeline_errors.jsonl", {"ts": datetime.now().isoformat(timespec="seconds"), "question_id": qid, "error": str(e), "traceback": tb, "question_preview": question_text[:400]})
+                write_text("diagnostics", f"pipeline_error_{qid}.txt", f"Error: {e}\n\nTrace:\n{tb}\n\nQuestion:\n{question_text}")
+            except Exception:
+                pass
 
         t_total = time.time() - t_start
 
@@ -373,6 +387,7 @@ def main():
     # Ablation Flags
     parser.add_argument("--no-rag", action="store_true", help="Disable RAG completely (pure generation)")
     parser.add_argument("--no-completion", action="store_true", help="Disable Critic and automatic supplementary retrieval")
+    parser.add_argument("--checkpoint-every", type=int, default=5, help="Write intermediate CSV every N items (default 5)")
 
     args = parser.parse_args()
 
@@ -396,11 +411,12 @@ def main():
 
     use_rag = not args.no_rag
     use_completion = not args.no_completion
+    checkpoint_every = max(1, int(args.checkpoint_every or 5))
 
     if args.csv:
-        run_inference_mode(args.csv, args.limit, use_rag=use_rag, use_completion=use_completion)
+        run_inference_mode(args.csv, args.limit, use_rag=use_rag, use_completion=use_completion, checkpoint_every=checkpoint_every)
     else:
-        run_benchmark_mode(args.subset, args.limit, args.ids, use_rag=use_rag, use_completion=use_completion)
+        run_benchmark_mode(args.subset, args.limit, args.ids, use_rag=use_rag, use_completion=use_completion, checkpoint_every=checkpoint_every)
 
 
 if __name__ == "__main__":

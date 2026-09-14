@@ -19,7 +19,7 @@ import hashlib
 from typing import Dict, Any, List, Union
 from datetime import datetime
 
-from openai import OpenAI
+from core.modelA import OpenAI
 
 from core.advanced_retriever import AdvancedRetriever
 from core.critic_agent import CRITIC_CALLS_PER_AGENT, evaluate_sufficiency

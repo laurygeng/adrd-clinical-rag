@@ -18,8 +18,8 @@ from typing import Tuple, List, Dict, Any, Optional
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
-from openai import OpenAI
-from core import local_google_shim as genai
+from core.modelA import OpenAI
+from core import modelB as genai
 
 # NLTK sentence splitter (English-friendly)
 import nltk
@@ -36,6 +36,8 @@ from core.trace_logger import (
     write_run_meta,
     get_run_dir,
 )
+
+import random
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -289,11 +291,11 @@ def _gap_is_negative(gap: str) -> bool:
 # ----------------------------
 # Model calls: Identify
 # ----------------------------
-def _call_openai(sys_prompt: str, user_prompt: str, temperature: float = 0.3, max_tokens: int = 40) -> str:
+def _call_openai(sys_prompt: str, user_prompt: str, temperature: float = 0.3, max_tokens: int = 40, model_override: Optional[str] = None) -> str:
     try:
         c = get_oai_client()
         r = c.chat.completions.create(
-            model="gpt-4o",
+            model=(model_override or "gpt-4o"),
             temperature=temperature,
             max_tokens=max_tokens,
             messages=[
@@ -321,6 +323,41 @@ def _call_gemini(sys_prompt: str, user_prompt: str, temperature: float = 0.3, ma
     except Exception as e:
         logging.warning(f"Critic gemini call failed: {e}")
         return ""
+
+
+def _select_veto_model_from_env() -> Optional[str]:
+    """Select a veto model from env var LOCAL_AGENT_C_MODELS.
+
+    Environment variables:
+    - LOCAL_AGENT_C_MODELS: comma-separated model ids
+    - LOCAL_AGENT_C_INDEX: optional integer index to pick deterministic model
+    If no env var set, returns None.
+    """
+    # First, allow an explicit single-model override for Model C
+    single = os.environ.get("LOCAL_AGENT_C_MODEL", "").strip()
+    if single:
+        return single
+
+    # Backward-compatible: comma-separated list support (legacy)
+    v = os.environ.get("LOCAL_AGENT_C_MODELS", "")
+    if not v:
+        return None
+    models = [m.strip() for m in v.split(",") if m.strip()]
+    if not models:
+        return None
+    idx_env = os.environ.get("LOCAL_AGENT_C_INDEX")
+    try:
+        if idx_env is not None:
+            idx = int(idx_env) % len(models)
+            return models[idx]
+    except Exception:
+        pass
+    # default simple time-based rotation
+    try:
+        idx = int(time.time()) % len(models)
+        return models[idx]
+    except Exception:
+        return random.choice(models)
 
 
 # ----------------------------
@@ -362,6 +399,7 @@ def _verify_locate_with_reranker(
     window_sents: int = 2,
     max_spans: int = 120,
     threshold: float = 0.45,
+    veto_model_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     spans = _make_sentence_windows(context, window_sents=window_sents, max_spans=max_spans)
     if not spans or retriever is None:
@@ -387,6 +425,7 @@ def _verify_locate_with_reranker(
     final_present = preliminary_present
 
     # [LLM Veto]: Double-check high-scoring spans using an LLM call to prevent semantic/question-matching hallucinations
+    selected_veto_model = veto_model_override or _select_veto_model_from_env()
     if preliminary_present and best_span:
         prompt_verify = (
             f"Determine if the following text snippet explicitly provides the missing information described as: '{gap}'.\n"
@@ -394,9 +433,15 @@ def _verify_locate_with_reranker(
             f"Snippet: {best_span}\n"
             f"Does the snippet provide the information? Reply ONLY YES or NO."
         )
-        llm_response = _call_openai("You are a strict text verification system.", prompt_verify, temperature=0.0, max_tokens=5)
+        llm_response = _call_openai(
+            "You are a strict text verification system.",
+            prompt_verify,
+            temperature=0.0,
+            max_tokens=5,
+            model_override=selected_veto_model,
+        )
         if "NO" in llm_response.upper():
-            logging.info(f"LLM Veto applied: Reranker score was {best_score:.3f} but LLM rejected the snippet.")
+            logging.info(f"LLM Veto applied: Reranker score was {best_score:.3f} but LLM rejected the snippet (model={selected_veto_model}).")
             final_present = False
 
     return {
@@ -406,6 +451,7 @@ def _verify_locate_with_reranker(
         "threshold": threshold,
         "n_spans": len(spans),
         "window_sents": window_sents,
+        "verify_model": selected_veto_model,
     }
 
 
@@ -456,6 +502,7 @@ def evaluate_sufficiency(
     verify_threshold: float = 0.35,
     verify_window_sents: int = 2,
     verify_max_spans: int = 120,
+    veto_model: Optional[str] = None,
 ) -> Tuple[bool, str, Dict[str, Any]]:
     ts = datetime.now().isoformat(timespec="seconds")
     run_dir = get_run_dir()
@@ -631,12 +678,15 @@ def evaluate_sufficiency(
                 window_sents=verify_window_sents,
                 max_spans=verify_max_spans,
                 threshold=verify_threshold,
+                veto_model_override=veto_model,
             )
             trace["verify_best_score"] = vr.get("best_score")
             trace["verify_best_span"] = vr.get("best_span", "")
             trace["verify_threshold"] = vr.get("threshold")
             trace["verify_n_spans"] = vr.get("n_spans")
             trace["verify_window_sents"] = vr.get("window_sents", verify_window_sents)
+            # record which model was used for veto (if any)
+            trace["verify_model"] = vr.get("verify_model") if isinstance(vr, dict) else None
 
             if vr.get("present") is True:
                 trace["verify_label"] = "PRESENT"

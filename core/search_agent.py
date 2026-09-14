@@ -12,7 +12,7 @@ import os
 import re
 import requests
 from typing import List, Dict, Tuple
-from openai import OpenAI
+from core.modelA import OpenAI
 
 # Try importing duckduckgo_search if available
 try:
