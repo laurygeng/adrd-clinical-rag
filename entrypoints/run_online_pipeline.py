@@ -2,7 +2,7 @@
 """
 Online Pipeline Batch Runner (entrypoints/)
 Role:
-1) Benchmark Mode (JSONs): Evaluate ADRD MC/TF, calculate accuracy, export clean CSV with Retrieved_Context and timings. (Resumable)
+1) Benchmark Mode (JSONs): Evaluate ADRD MC/TF, calculate accuracy, export clean CSV with Retrieved_Passages and timings. (Resumable)
 2) Inference Mode (CSV): Process custom CSV, append answers. (Resumable)
 
 ** ABLATION SUPPORT ADDED **
@@ -20,16 +20,17 @@ from typing import Optional, Set, List, Dict, Any
 
 import pandas as pd
 import traceback
-from core.trace_logger import write_jsonl, write_text
 from tqdm import tqdm
 
 # -----------------------------------------------------------------------------
-# Path setup: entrypoints/ is sibling of core/ and data/
+# Path setup: MUST BE BEFORE importing 'core' modules
 # -----------------------------------------------------------------------------
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.insert(0, PROJECT_ROOT)
-sys.path.insert(0, os.path.join(PROJECT_ROOT, "core"))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
+# 现在环境变量配置好了，可以安全导入 core 模块了
+from core.trace_logger import write_jsonl, write_text
 from core.orchestrator import run_pipeline
 from core.answer_agent import check_accuracy
 
@@ -121,7 +122,6 @@ def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str], use_rag:
     output_dir = os.path.join(PROJECT_ROOT, "evaluation_results")
     os.makedirs(output_dir, exist_ok=True)
 
-    # 动态生成消融实验的文件标签
     ablation_tag = ""
     if not use_rag:
         ablation_tag += "_NO_RAG"
@@ -218,7 +218,7 @@ def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str], use_rag:
                 "Generated_Answer": generated_answer,
                 "Ground_Truth_Answer": row["Ground_Truth_Answer"],
                 "Is_Correct": is_correct,
-                "Retrieved_Context": retrieved_context,
+                "Retrieved_Passages": retrieved_context,
                 "Time_Total_Item": round(t_total, 2),
                 "Time_Base_Retrieval": round(t_base, 2) if t_base is not None else "",
                 "Time_Critic_Evaluation": round(t_critic, 2) if t_critic is not None else "",
@@ -262,7 +262,10 @@ def run_inference_mode(csv_path: str, limit: int, use_rag: bool, use_completion:
         logging.error("The provided CSV is empty.")
         return
 
-    if "Question_ID" not in df_questions.columns:
+    # 规范化处理输入 CSV 的 ID 列名，防止后续重复添加 Question_ID
+    if "Question ID" in df_questions.columns:
+        df_questions["Question_ID"] = df_questions["Question ID"]
+    elif "Question_ID" not in df_questions.columns:
         df_questions["Question_ID"] = [f"Custom_Q_{i:04d}" for i in range(len(df_questions))]
 
     if limit > 0:
@@ -347,10 +350,20 @@ def run_inference_mode(csv_path: str, limit: int, use_rag: bool, use_completion:
 
         t_total = time.time() - t_start
 
+        # 清理并规范字典字段，确保不会有多余/冲突的重复列
         rec = row.to_dict()
+        
+        # 将原始可能叫 'Answer' 的基准列自动重命名为标准化的 'Ground_Truth_Answer'
+        if "Answer" in rec and "Ground_Truth_Answer" not in rec:
+            rec["Ground_Truth_Answer"] = rec.pop("Answer")
+            
+        # 移除可能由上面逻辑带来的重复 Question_ID（保留原本的 Question ID）
+        if "Question ID" in rec and "Question_ID" in rec:
+            del rec["Question_ID"]
+
         rec.update({
             "Generated_Answer": generated_answer,
-            "Retrieved_Context": retrieved_context,
+            "Retrieved_Passages": retrieved_context,
             "Time_Total_Item": round(t_total, 2),
             "Time_Base_Retrieval": round(t_base, 2) if t_base is not None else "",
             "Time_Critic_Evaluation": round(t_critic, 2) if t_critic is not None else "",

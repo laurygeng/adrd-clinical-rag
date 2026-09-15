@@ -60,20 +60,30 @@ def clean_search_query_text(text: str, fallback: str = "") -> str:
     return cleaned
 
 
-def _generate_query(client: OpenAI, target_info: str, question: str = "", model: str = "gpt-4o-mini") -> str:
+def _generate_query(client: OpenAI, target_info: str, question: str = "", model: str = "gpt-4o-mini", q_type: str = "MC") -> str:
     """Generate a precise medical search query combining question context and target info."""
     
-    # [MODIFIED]: 泛化检索意图，屏蔽题目中过分具体的（甚至可能是错误的）行为约束
-    prompt = (
-        "You are a medical research assistant. Given a target missing fact and the original question, "
-        "generate ONE highly specific, concise medical search query (3-6 keywords) focused on Alzheimer's Disease, "
-        "dementia care guidelines, or clinical facts.\n"
-        "IMPORTANT: Focus the query on the core medical entity or general topic to retrieve standard facts or best practices. "
-        "Ignore the specific behavioral claims or rigid constraints from the question, as they might be false premises/myths.\n"
-        "Output ONLY the query text, with no quotes, markdown, or preamble.\n\n"
-        f"Original Question: {question}\n"
-        f"Missing Target Info: {target_info}\nQuery:"
-    )
+    if str(q_type).strip().upper() == "QA":
+        prompt = (
+            "You are a medical research assistant. Given a target missing fact and the original question, "
+            "generate ONE highly specific, concise medical search query (3-6 keywords) focused on Alzheimer's Disease, "
+            "dementia care guidelines, or clinical facts.\n"
+            "CRITICAL: Focus the query on the core medical entity or specific scenario mentioned. Do NOT generalize.\n"
+            "Output ONLY the query text, with no quotes, markdown, or preamble.\n\n"
+            f"Original Question: {question}\n"
+            f"Missing Target Info: {target_info}\nQuery:"
+        )
+    else:
+        prompt = (
+            "You are a medical research assistant. Given a target missing fact and the original question, "
+            "generate ONE highly specific, concise medical search query (3-6 keywords) focused on Alzheimer's Disease, "
+            "dementia care guidelines, or clinical facts.\n"
+            "IMPORTANT: Focus the query on the core medical entity or general topic to retrieve standard facts or best practices. "
+            "Ignore the specific behavioral claims or rigid constraints from the question, as they might be false premises/myths.\n"
+            "Output ONLY the query text, with no quotes, markdown, or preamble.\n\n"
+            f"Original Question: {question}\n"
+            f"Missing Target Info: {target_info}\nQuery:"
+        )
     
     try:
         r = client.chat.completions.create(
@@ -89,19 +99,19 @@ def _generate_query(client: OpenAI, target_info: str, question: str = "", model:
 
 
 def _refine_evidence_text(client: OpenAI, query: str, raw_text: str) -> str:
-    """Knowledge Refinement: Extract only the sentences relevant to the medical query, stripping noise."""
+    """Knowledge Refinement: Extract relevant sentences but preserve context."""
     if not raw_text or len(raw_text) < 20:
         return ""
     prompt = (
-        f"Extract and summarize ONLY the specific clinical or caregiving facts from the text below that directly answer or verify: '{query}'. "
-        "Discard unrelated chit-chat, website navigation, or boilerplate text. Keep it under 3 concise sentences.\n\n"
-        f"Text:\n{raw_text[:1000]}\n\nExtracted Facts:"
+        f"Extract the specific paragraphs and clinical facts from the text below that directly answer or verify: '{query}'. "
+        "Discard unrelated chit-chat or website navigation, but KEEP the full context of the relevant medical facts. Do NOT over-compress.\n\n"
+        f"Text:\n{raw_text[:1200]}\n\nExtracted Facts:"
     )
     try:
         r = client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.0,
-            max_tokens=100,
+            max_tokens=250,
             messages=[{"role": "user", "content": prompt}],
         )
         return (r.choices[0].message.content or "").strip()
@@ -110,137 +120,116 @@ def _refine_evidence_text(client: OpenAI, query: str, raw_text: str) -> str:
 
 
 def _europepmc(query: str, n: int = 3) -> List[Dict[str, str]]:
-    """EuropePMC backend (Free medical literature database - PubMed abstracts)."""
-    try:
-        # Append Alzheimer's/dementia context if not present to keep medical focus
-        med_query = query if "dementia" in query.lower() or "alzheimer" in query.lower() else f"{query} dementia"
-        params = {"query": med_query, "format": "json", "pageSize": n, "resultType": "core"}
-        d = requests.get(
-            "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
-            params=params,
-            headers=UA,
-            timeout=30,
-        ).json()
+    med_query = query if "dementia" in query.lower() or "alzheimer" in query.lower() else f"{query} dementia"
+    params = {"query": med_query, "format": "json", "pageSize": n, "resultType": "core"}
+    d = requests.get(
+        "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
+        params=params,
+        headers=UA,
+        timeout=10,
+    ).json()
 
-        out: List[Dict[str, str]] = []
-        for x in (d.get("resultList", {}) or {}).get("result", []) or []:
-            title = (x.get("title") or "").strip()
-            text = x.get("abstractText") or x.get("title") or ""
-            text = re.sub(r"<[^>]+>", " ", text).strip()
+    out: List[Dict[str, str]] = []
+    for x in (d.get("resultList", {}) or {}).get("result", []) or []:
+        title = (x.get("title") or "").strip()
+        text = x.get("abstractText") or x.get("title") or ""
+        text = re.sub(r"<[^>]+>", " ", text).strip()
 
-            src = (x.get("source") or "").strip()
-            pid = (x.get("id") or "").strip()
-            url = f"https://europepmc.org/article/{src}/{pid}" if src and pid else ""
+        src = (x.get("source") or "").strip()
+        pid = (x.get("id") or "").strip()
+        url = f"https://europepmc.org/article/{src}/{pid}" if src and pid else ""
 
-            if text:
-                out.append(
-                    {
-                        "source": "europepmc",
-                        "title": title,
-                        "url": url,
-                        "text": text[:800],
-                    }
-                )
-        return out
-    except Exception:
-        return []
+        if text:
+            out.append({"source": "europepmc", "title": title, "url": url, "text": text[:800]})
+    return out
 
 
 def _duckduckgo(query: str, n: int = 3) -> List[Dict[str, str]]:
-    """DuckDuckGo free search backend (No API key required)."""
     if not HAS_DDGS:
-        return []
+        raise RuntimeError("duckduckgo_search library is not installed.")
     out = []
-    try:
-        with DDGS() as ddgs:
-            results = [r for r in ddgs.text(query, max_results=n)]
-            for res in results:
-                body = (res.get("body") or "").strip()
-                if not body:
-                    continue
-                out.append(
-                    {
-                        "source": "duckduckgo",
-                        "title": (res.get("title") or "").strip(),
-                        "url": (res.get("href") or "").strip(),
-                        "text": body[:800],
-                    }
-                )
-    except Exception:
-        pass
+    with DDGS() as ddgs:
+        results = [r for r in ddgs.text(query, max_results=n)]
+        for res in results:
+            body = (res.get("body") or "").strip()
+            if not body:
+                continue
+            out.append({
+                "source": "duckduckgo",
+                "title": (res.get("title") or "").strip(),
+                "url": (res.get("href") or "").strip(),
+                "text": body[:800],
+            })
     return out
 
 
 def _local_fallback(query: str, retriever) -> List[Dict[str, str]]:
-    """Local retriever fallback if web searches return nothing."""
     if retriever is None:
-        return []
-    try:
-        wp, _, _ = retriever.get_retrieved_passages(
-            query,
-            top_k=6,
-            pre_k=20,
-            window_size=500,
-        )
-        out: List[Dict[str, str]] = []
-        for p in wp[:10]:
-            text = (p or "").strip()
-            if text:
-                out.append(
-                    {
-                        "source": "local_fallback",
-                        "title": "",
-                        "url": "",
-                        "text": text,
-                    }
-                )
-        return out
-    except Exception:
-        return []
+        raise ValueError("No local retriever provided for fallback.")
+    wp, _, _ = retriever.get_retrieved_passages(
+        query,
+        top_k=6,
+        pre_k=20,
+        window_size=500,
+    )
+    out: List[Dict[str, str]] = []
+    for p in wp[:10]:
+        text = (p or "").strip()
+        if text:
+            out.append({"source": "local_fallback", "title": "", "url": "", "text": text})
+    return out
 
 
-def research(client: OpenAI, target_info: str, question: str = "", retriever=None) -> Tuple[List[Dict[str, str]], str, str]:
+def research(client: OpenAI, target_info: str, question: str = "", retriever=None, q_type: str = "MC") -> Tuple[List[Dict[str, str]], str, str]:
     """
     Execute a free, medical-focused external search (EuropePMC -> DuckDuckGo -> Local Fallback)
     with query contextualization and LLM-based evidence refinement.
-
-    Returns:
-      (evidence_items, search_query_used, search_log_markdown)
     """
     log_lines = ["\n## Completion Retrieval (Web Search) Log\n"]
     
-    query = _generate_query(client, target_info, question=question)
+    query = _generate_query(client, target_info, question=question, q_type=q_type)
     log_lines.append(f"- **Generated Search Query**: `{query}`")
 
     ev: List[Dict[str, str]] = []
     
-    # 1. 优先 EuropePMC 
-    epmc = _europepmc(query, 3)
-    if epmc:
-        log_lines.append(f"- **EuropePMC**: Found {len(epmc)} results.")
-        ev.extend(epmc)
-    else:
-        log_lines.append("- **EuropePMC**: Found 0 results. Falling back to DuckDuckGo...")
-
-    # 2. 兜底 DuckDuckGo
-    if not ev:
-        ddg = _duckduckgo(query, 3)
-        if ddg:
-            log_lines.append(f"- **DuckDuckGo**: Found {len(ddg)} results.")
-            ev.extend(ddg)
+    # 1. EuropePMC
+    try:
+        epmc = _europepmc(query, 3)
+        if epmc:
+            log_lines.append(f"- **EuropePMC**: Found {len(epmc)} results.")
+            ev.extend(epmc)
         else:
-            log_lines.append("- **DuckDuckGo**: Found 0 results. Falling back to Local Retrieval...")
+            log_lines.append("- **EuropePMC**: Found 0 results.")
+    except Exception as e:
+        log_lines.append(f"- **EuropePMC ERROR**: {str(e)}")
 
-    # 3. 最终本地兜底
+    # 2. DuckDuckGo
     if not ev:
-        loc = _local_fallback(query, retriever)
-        if loc:
-            log_lines.append(f"- **Local Fallback**: Found {len(loc)} results.")
-            ev.extend(loc)
-        else:
-            log_lines.append("- **Local Fallback**: Found 0 results.")
+        log_lines.append("- Falling back to DuckDuckGo...")
+        try:
+            ddg = _duckduckgo(query, 3)
+            if ddg:
+                log_lines.append(f"- **DuckDuckGo**: Found {len(ddg)} results.")
+                ev.extend(ddg)
+            else:
+                log_lines.append("- **DuckDuckGo**: Found 0 results.")
+        except Exception as e:
+            log_lines.append(f"- **DuckDuckGo ERROR**: {str(e)}")
 
-    # 4. LLM 证据清洗
+    # 3. Local Fallback
+    if not ev:
+        log_lines.append("- Falling back to Local Retrieval...")
+        try:
+            loc = _local_fallback(query, retriever)
+            if loc:
+                log_lines.append(f"- **Local Fallback**: Found {len(loc)} results.")
+                ev.extend(loc)
+            else:
+                log_lines.append("- **Local Fallback**: Found 0 results.")
+        except Exception as e:
+            log_lines.append(f"- **Local Fallback ERROR**: {str(e)}")
+
+    # 4. Refinement
     log_lines.append("\n### LLM Evidence Refinement (Noise Filtering)\n")
     refined_evidence: List[Dict[str, str]] = []
     for i, item in enumerate(ev):
@@ -262,5 +251,4 @@ def research(client: OpenAI, target_info: str, question: str = "", retriever=Non
     final_ev = refined_evidence if refined_evidence else ev
     log_lines.append(f"\n- **Final Evidence Count**: Returned {len(final_ev)} item(s) to Orchestrator.\n")
 
-    # 返回这三个变量
     return final_ev, query, "\n".join(log_lines)

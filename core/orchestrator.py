@@ -10,6 +10,7 @@ Key hardening:
 
 ** ABLATION SUPPORT ADDED **
 - Added parameters to selectively disable Base RAG and/or Completion Retrieval.
+- [NEW] QA Isolation: Specific routing, query generation, and context chunking rules for QA.
 """
 
 import os
@@ -96,9 +97,8 @@ def sanitize_gap_text(gap: str) -> str:
     return g[:160]
 
 
-def generate_web_rewrite_query(statement: str, gap_hint: str = "") -> str:
-    """精简版复合检索 Query 生成：只提取核心问题主题与缺失事实，严禁包含选项字母和内容"""
-    # 过滤掉题干中的 Options 部分，只保留问题本身
+def generate_web_rewrite_query(statement: str, gap_hint: str = "", q_type: str = "MC") -> str:
+    """精简版复合检索 Query 生成：根据题型(QA vs MC/TF)隔离 Prompt，防止泛化导致召回偏差"""
     clean_statement = statement.split("Options:")[0].strip()
     gh = sanitize_gap_text(gap_hint)
     
@@ -108,17 +108,28 @@ def generate_web_rewrite_query(statement: str, gap_hint: str = "") -> str:
     client = get_oai_client()
     sys_prompt = "You are an expert medical search query generator. Output a concise search query (3-7 keywords)."
     
-    # [MODIFIED]: 泛化 Query 提取提示词，避免带入具体的负面断言/误区动作
-    user_prompt = (
-        f"Question: {clean_statement}\n"
-        f"Missing Fact to Find: {gh}\n\n"
-        "Generate a short, precise search query (3-7 keywords). "
-        "CRITICAL RULE: Extract the broad medical concept, intervention, or clinical topic. "
-        "Do NOT include the specific assertions, restrictive behaviors, or exact claims made in the question, "
-        "as those may be the 'myths' or 'false statements' being tested. Formulate the query to find the general factual baseline or standard best practices for the topic.\n"
-        "Do NOT include option letters (A, B, C, D, E). "
-        "Output ONLY the query text without quotes or preamble."
-    )
+    if str(q_type).strip().upper() == "QA":
+        # QA 专属 Prompt：严禁泛化，必须保留具体实体
+        user_prompt = (
+            f"Question: {clean_statement}\n"
+            f"Missing Fact to Find: {gh}\n\n"
+            "Generate a highly specific search query (3-7 keywords). "
+            "CRITICAL: You MUST retain the exact medical conditions, interventions (e.g. secondhand smoke), "
+            "or specific scenarios mentioned in the question. Do NOT generalize the topic into broad guidelines. "
+            "Output ONLY the query text without quotes or preamble."
+        )
+    else:
+        # MC/TF 保持原有的泛化 Prompt
+        user_prompt = (
+            f"Question: {clean_statement}\n"
+            f"Missing Fact to Find: {gh}\n\n"
+            "Generate a short, precise search query (3-7 keywords). "
+            "CRITICAL RULE: Extract the broad medical concept, intervention, or clinical topic. "
+            "Do NOT include the specific assertions, restrictive behaviors, or exact claims made in the question, "
+            "as those may be the 'myths' or 'false statements' being tested. Formulate the query to find the general factual baseline or standard best practices for the topic.\n"
+            "Do NOT include option letters (A, B, C, D, E). "
+            "Output ONLY the query text without quotes or preamble."
+        )
     
     try:
         r = client.chat.completions.create(
@@ -138,12 +149,13 @@ def generate_web_rewrite_query(statement: str, gap_hint: str = "") -> str:
 
 
 def run_pipeline(question: str, q_type: str = "MC", question_id: str = "", use_rag: bool = True, use_completion: bool = True) -> Dict[str, Any]:
-    # Only initialize Retriever if RAG is used to save memory
     retriever = get_retriever() if (use_rag or use_completion) else None
     client = get_oai_client()
 
     run_dir = get_run_dir()
     item_id = make_item_id(question_id, question)
+    is_qa = (q_type.strip().upper() == "QA")
+    is_tf = (q_type.strip().upper() == "TF")
 
     trace_log: Dict[str, Any] = {
         "run_dir": run_dir,
@@ -181,7 +193,7 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "", use_r
         "time_answer_generation": 0.0,
     }
 
-    # STEP 1: Base Retrieval (Time tracking and ablation control)
+    # STEP 1: Base Retrieval
     t0 = time.time()
     if use_rag:
         logging.info("Step 1: Running Base Retrieval...")
@@ -198,7 +210,7 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "", use_r
         base_context = ""
     trace_log["time_base_retrieval"] = time.time() - t0
 
-    # STEP 2: Critic (Unified) (Time tracking and ablation control)
+    # STEP 2: Critic Evaluation
     t0 = time.time()
     if use_completion:
         logging.info("Step 2: Critic Agent evaluating sufficiency...")
@@ -238,13 +250,16 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "", use_r
         trace_log["is_sufficient"] = True
     trace_log["time_critic_evaluation"] = time.time() - t0
 
-    # STEP 3-5: Unified Completion Routing (Time tracking and ablation control)
+    # STEP 3-5: Unified Completion Routing with QA Isolation
     final_context = base_context
     critic_verify_label = (trace_log.get("critic_verify_label") or "").strip().upper()
     consensus_gap_is_negative = bool(trace_log.get("critic_consensus_gap_is_negative"))
 
-    # [PAPER-READY UNIFIED ROUTING]: 恢复全量统一触发，不针对题型做特判
-    should_complete = use_completion and (not is_sufficient) and (critic_verify_label == "ABSENT") and (not consensus_gap_is_negative)
+    if is_qa:
+        # QA 专属激进补全条件：只要不充分就立即补全
+        should_complete = use_completion and (not is_sufficient)
+    else:
+        should_complete = use_completion and (not is_sufficient) and (critic_verify_label == "ABSENT") and (not consensus_gap_is_negative)
     
     t0 = time.time()
     if should_complete:
@@ -252,7 +267,7 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "", use_r
         trace_log["completion_reason"] = "critic_insufficient_and_absent"
 
         logging.info("Step 3: Triggering Completion Retrieval with Hybrid Question-Gap Query...")
-        completion_query = generate_web_rewrite_query(statement=question, gap_hint=trace_log.get('missing_info', ''))
+        completion_query = generate_web_rewrite_query(statement=question, gap_hint=trace_log.get('missing_info', ''), q_type=q_type)
         trace_log["web_query_used"] = completion_query
         
         gap_passages, _, _ = retriever.get_retrieved_passages(
@@ -262,38 +277,40 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "", use_r
             vector_weight=0.4,
         )
         
-        base_tagged = [f"[BASE] {p}" for p in base_passages[:3]]
+        base_tagged = [f"[BASE] {p}" for p in base_passages[:4]]
         gap_tagged = [f"[GAP] {p}" for p in gap_passages[:3]]
 
         web_passages_trimmed = []
         try:
-            # [MODIFIED]: 接收第三个参数 search_log_md 
             web_evidence, web_query, search_log_md = research(
                 client=client,
                 target_info=completion_query,
                 question=question,
                 retriever=retriever,
+                q_type=q_type,
             )
             
-            # --- 新增：把外网搜索日志追加到 MD 文件中 ---
             md_path = trace_log.get("critic_md_path")
             if md_path and os.path.exists(md_path):
                 with open(md_path, "a", encoding="utf-8") as f:
                     f.write(search_log_md)
-            # ---------------------------------------------
             
             web_passages = format_evidence_items(web_evidence)
-            web_passages_trimmed = web_passages[:1]  # 仅保留高质量的 1 段外网文本
+            web_passages_trimmed = web_passages[:1]
         except Exception as e:
             logging.warning(f"Web retrieval failed: {e}. Proceeding with local gap passages only.")
 
-        # 采用高精度证据前置排列与长度自适应截断，平衡补全收益与抗噪能力
-        prioritized_passages = gap_tagged + web_passages_trimmed + base_tagged
+        # QA 专属拼接优先级: 确保 base 压舱石在最前，防止被 [GAP] 顶掉
+        if is_qa:
+            prioritized_passages = base_tagged[:2] + web_passages_trimmed + gap_tagged + base_tagged[2:]
+            MAX_CONTEXT_CHARS = 12000
+            max_sources = 6
+        else:
+            prioritized_passages = gap_tagged + web_passages_trimmed + base_tagged
+            MAX_CONTEXT_CHARS = 8000 if is_tf else 12000
+            max_sources = 4 if is_tf else 6
+            
         merged_passages = deduplicate_passages(prioritized_passages)
-        
-        is_tf = (q_type.strip().upper() == "TF")
-        MAX_CONTEXT_CHARS = 8000 if is_tf else 12000
-        max_sources = 4 if is_tf else 6
         
         current_chars = 0
         final_passages = []
@@ -310,7 +327,7 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "", use_r
             logging.info("Step 3-5: SKIPPED (Ablation: No Completion Retrieval)")
     trace_log["time_completion_retrieval"] = time.time() - t0
 
-    # STEP 6: Final Answer (Unified Delegation to LLM) (Time tracking)
+    # STEP 6: Final Answer
     logging.info("Step 6: Answer Agent generating final output...")
     t0 = time.time()
     final_answer = generate_final_answer(
