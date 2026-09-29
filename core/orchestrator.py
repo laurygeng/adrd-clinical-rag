@@ -1,37 +1,37 @@
 #!/usr/bin/env python3
 """
-Orchestrator (Unified ItV Architecture)
+Orchestrator (Unified ItV Architecture & Multi-Agent Pipeline)
 
 Key hardening:
 - All question types (TF, MC, QA) use the unified Identify-then-Verify (ItV) gap mechanism.
 - Removed legacy NLI branching.
-- Answers are delegated to the LLM (gpt-4o shim) to evaluate the final unified context.
+- Answers and validations are delegated to the Unified Local LLM Engine.
+- Context assembly is fully offloaded to Integration Agent.
 - Added precise step-by-step execution timers for benchmarking.
 
 ** ABLATION SUPPORT ADDED **
-- Added parameters to selectively disable Base RAG and/or Completion Retrieval.
-- [NEW] QA Isolation: Specific routing, query generation, and context chunking rules for QA.
+- Parameters to selectively disable Base RAG and/or Completion Retrieval.
+- Global model routing via GLOBAL_AGENT_MODEL environment variable.
 """
 
 import os
 import time
 import logging
-import hashlib
-from typing import Dict, Any, List, Union
+from typing import Dict, Any
 from datetime import datetime
 
-from core.modelA import OpenAI
-
+from core.llm_engine import LocalLLMClient
 from core.advanced_retriever import AdvancedRetriever
 from core.critic_agent import CRITIC_CALLS_PER_AGENT, evaluate_sufficiency
-from core.answer_agent import generate_final_answer
 from core.search_agent import clean_search_query_text, research
+from core.answer_agent import generate_final_answer
+from core.integration_agent import assemble_context
 from core.trace_logger import write_jsonl, make_item_id, get_run_dir
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 _retriever_instance = None
-_oai_client = None
+_llm_client = None
 
 
 def get_retriever():
@@ -42,50 +42,11 @@ def get_retriever():
     return _retriever_instance
 
 
-def get_oai_client():
-    global _oai_client
-    if _oai_client is None:
-        _oai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    return _oai_client
-
-
-def deduplicate_passages(passages: List[str]) -> List[str]:
-    seen_hashes = set()
-    unique: List[str] = []
-    for p in passages or []:
-        if not p:
-            continue
-        h = hashlib.md5(p.strip()[:100].encode("utf-8")).hexdigest()
-        if h not in seen_hashes:
-            seen_hashes.add(h)
-            unique.append(p)
-    return unique
-
-
-def format_evidence_items(evidence_items: List[Union[str, Dict[str, Any]]]) -> List[str]:
-    out: List[str] = []
-    for ev in evidence_items or []:
-        if isinstance(ev, str):
-            t = ev.strip()
-            if t:
-                out.append(t)
-            continue
-
-        source = (ev.get("source") or "").strip()
-        title = (ev.get("title") or "").strip()
-        url = (ev.get("url") or "").strip()
-        text = (ev.get("text") or "").strip()
-        if not text:
-            continue
-
-        header = f"[WEB:{source}]"
-        if title:
-            header += f" {title}"
-        if url:
-            header += f" ({url})"
-        out.append(header + "\n" + text)
-
-    return out
+def get_llm_client():
+    global _llm_client
+    if _llm_client is None:
+        _llm_client = LocalLLMClient()
+    return _llm_client
 
 
 def sanitize_gap_text(gap: str) -> str:
@@ -97,7 +58,7 @@ def sanitize_gap_text(gap: str) -> str:
     return g[:160]
 
 
-def generate_web_rewrite_query(statement: str, gap_hint: str = "", q_type: str = "MC") -> str:
+def generate_web_rewrite_query(statement: str, gap_hint: str = "", q_type: str = "MC", model_name: str = "gpt-4o") -> str:
     """精简版复合检索 Query 生成：根据题型(QA vs MC/TF)隔离 Prompt，防止泛化导致召回偏差"""
     clean_statement = statement.split("Options:")[0].strip()
     gh = sanitize_gap_text(gap_hint)
@@ -105,7 +66,7 @@ def generate_web_rewrite_query(statement: str, gap_hint: str = "", q_type: str =
     if not gh:
         return clean_statement[:100]
         
-    client = get_oai_client()
+    client = get_llm_client()
     sys_prompt = "You are an expert medical search query generator. Output a concise search query (3-7 keywords)."
     
     if str(q_type).strip().upper() == "QA":
@@ -133,7 +94,7 @@ def generate_web_rewrite_query(statement: str, gap_hint: str = "", q_type: str =
     
     try:
         r = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=model_name,
             temperature=0.0,
             max_tokens=25,
             messages=[
@@ -150,7 +111,10 @@ def generate_web_rewrite_query(statement: str, gap_hint: str = "", q_type: str =
 
 def run_pipeline(question: str, q_type: str = "MC", question_id: str = "", use_rag: bool = True, use_completion: bool = True) -> Dict[str, Any]:
     retriever = get_retriever() if (use_rag or use_completion) else None
-    client = get_oai_client()
+    client = get_llm_client()
+    
+    # 动态获取全局统一的测试模型名称
+    global_model = os.environ.get("GLOBAL_AGENT_MODEL", "gpt-4o")
 
     run_dir = get_run_dir()
     item_id = make_item_id(question_id, question)
@@ -195,6 +159,18 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "", use_r
 
     # STEP 1: Base Retrieval
     t0 = time.time()
+    
+    # clean_query = question.split("Options:")[0].strip() if "Options:" in question else question
+    
+    # if use_rag:
+    #     logging.info("Step 1: Running Base Retrieval...")
+    #     base_passages, _, _ = retriever.get_retrieved_passages(
+    #         clean_query,  # 【关键修改】：这里将 question 替换为 clean_query
+    #         top_k=8,
+    #         bm25_weight=0.3,
+    #         vector_weight=0.7,
+    #     )
+        
     if use_rag:
         logging.info("Step 1: Running Base Retrieval...")
         base_passages, _, _ = retriever.get_retrieved_passages(
@@ -250,7 +226,7 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "", use_r
         trace_log["is_sufficient"] = True
     trace_log["time_critic_evaluation"] = time.time() - t0
 
-    # STEP 3-5: Unified Completion Routing with QA Isolation
+    # STEP 3 & 4: Unified Completion Routing & Integration
     final_context = base_context
     critic_verify_label = (trace_log.get("critic_verify_label") or "").strip().upper()
     consensus_gap_is_negative = bool(trace_log.get("critic_consensus_gap_is_negative"))
@@ -267,20 +243,19 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "", use_r
         trace_log["completion_reason"] = "critic_insufficient_and_absent"
 
         logging.info("Step 3: Triggering Completion Retrieval with Hybrid Question-Gap Query...")
-        completion_query = generate_web_rewrite_query(statement=question, gap_hint=trace_log.get('missing_info', ''), q_type=q_type)
+        completion_query = generate_web_rewrite_query(statement=question, gap_hint=trace_log.get('missing_info', ''), q_type=q_type, model_name=global_model)
         trace_log["web_query_used"] = completion_query
         
+        # 3a. Local Gap Retrieval
         gap_passages, _, _ = retriever.get_retrieved_passages(
             completion_query,
             top_k=5,
             bm25_weight=0.6,
             vector_weight=0.4,
         )
-        
-        base_tagged = [f"[BASE] {p}" for p in base_passages[:4]]
-        gap_tagged = [f"[GAP] {p}" for p in gap_passages[:3]]
 
-        web_passages_trimmed = []
+        # 3b. Web Search & Refinement
+        web_evidence = []
         try:
             web_evidence, web_query, search_log_md = research(
                 client=client,
@@ -288,54 +263,38 @@ def run_pipeline(question: str, q_type: str = "MC", question_id: str = "", use_r
                 question=question,
                 retriever=retriever,
                 q_type=q_type,
+                model_name=global_model
             )
             
             md_path = trace_log.get("critic_md_path")
             if md_path and os.path.exists(md_path):
                 with open(md_path, "a", encoding="utf-8") as f:
                     f.write(search_log_md)
-            
-            web_passages = format_evidence_items(web_evidence)
-            web_passages_trimmed = web_passages[:1]
         except Exception as e:
             logging.warning(f"Web retrieval failed: {e}. Proceeding with local gap passages only.")
 
-        # QA 专属拼接优先级: 确保 base 压舱石在最前，防止被 [GAP] 顶掉
-        if is_qa:
-            prioritized_passages = base_tagged[:2] + web_passages_trimmed + gap_tagged + base_tagged[2:]
-            MAX_CONTEXT_CHARS = 12000
-            max_sources = 6
-        else:
-            prioritized_passages = gap_tagged + web_passages_trimmed + base_tagged
-            MAX_CONTEXT_CHARS = 8000 if is_tf else 12000
-            max_sources = 4 if is_tf else 6
-            
-        merged_passages = deduplicate_passages(prioritized_passages)
-        
-        current_chars = 0
-        final_passages = []
-        
-        for p in merged_passages[:max_sources]:
-            if current_chars + len(p) > MAX_CONTEXT_CHARS and len(final_passages) >= 2:
-                break
-            final_passages.append(p)
-            current_chars += len(p)
-            
-        final_context = "\n\n".join(final_passages)
+        # 4. Context Assembly (Integration Agent)
+        logging.info("Step 4: Integration Agent assembling cohesive context...")
+        final_context = assemble_context(
+            base_passages=base_passages,
+            gap_passages=gap_passages,
+            web_evidence=web_evidence,
+            q_type=q_type
+        )
     else:
         if not use_completion:
-            logging.info("Step 3-5: SKIPPED (Ablation: No Completion Retrieval)")
+            logging.info("Step 3-4: SKIPPED (Ablation: No Completion Retrieval)")
     trace_log["time_completion_retrieval"] = time.time() - t0
 
-    # STEP 6: Final Answer
-    logging.info("Step 6: Answer Agent generating final output...")
+    # STEP 5: Final Answer
+    logging.info("Step 5: Answer Agent generating final output...")
     t0 = time.time()
     final_answer = generate_final_answer(
         client=client,
         question=question,
         context=final_context,
         q_type=q_type,
-        model_name="gpt-4o",
+        model_name=global_model,
     )
     trace_log["time_answer_generation"] = time.time() - t0
 

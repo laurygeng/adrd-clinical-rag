@@ -12,7 +12,7 @@ import os
 import re
 import requests
 from typing import List, Dict, Tuple
-from core.modelA import OpenAI
+from core.llm_engine import LocalLLMClient
 
 # Try importing duckduckgo_search if available
 try:
@@ -60,7 +60,7 @@ def clean_search_query_text(text: str, fallback: str = "") -> str:
     return cleaned
 
 
-def _generate_query(client: OpenAI, target_info: str, question: str = "", model: str = "gpt-4o-mini", q_type: str = "MC") -> str:
+def _generate_query(client: LocalLLMClient, target_info: str, question: str = "", model: str = "gpt-4o", q_type: str = "MC") -> str:
     """Generate a precise medical search query combining question context and target info."""
     
     if str(q_type).strip().upper() == "QA":
@@ -98,7 +98,7 @@ def _generate_query(client: OpenAI, target_info: str, question: str = "", model:
         return clean_search_query_text(target_info, fallback=target_info)
 
 
-def _refine_evidence_text(client: OpenAI, query: str, raw_text: str) -> str:
+def _refine_evidence_text(client: LocalLLMClient, query: str, raw_text: str, model: str = "gpt-4o") -> str:
     """Knowledge Refinement: Extract relevant sentences but preserve context."""
     if not raw_text or len(raw_text) < 20:
         return ""
@@ -109,7 +109,7 @@ def _refine_evidence_text(client: OpenAI, query: str, raw_text: str) -> str:
     )
     try:
         r = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=model,
             temperature=0.0,
             max_tokens=250,
             messages=[{"role": "user", "content": prompt}],
@@ -180,14 +180,15 @@ def _local_fallback(query: str, retriever) -> List[Dict[str, str]]:
     return out
 
 
-def research(client: OpenAI, target_info: str, question: str = "", retriever=None, q_type: str = "MC") -> Tuple[List[Dict[str, str]], str, str]:
+def research(client: LocalLLMClient, target_info: str, question: str = "", retriever=None, q_type: str = "MC", model_name: str = "gpt-4o") -> Tuple[List[Dict[str, str]], str, str]:
     """
     Execute a free, medical-focused external search (EuropePMC -> DuckDuckGo -> Local Fallback)
     with query contextualization and LLM-based evidence refinement.
     """
     log_lines = ["\n## Completion Retrieval (Web Search) Log\n"]
     
-    query = _generate_query(client, target_info, question=question, q_type=q_type)
+    # 动态透传模型参数
+    query = _generate_query(client, target_info, question=question, model=model_name, q_type=q_type)
     log_lines.append(f"- **Generated Search Query**: `{query}`")
 
     ev: List[Dict[str, str]] = []
@@ -234,7 +235,8 @@ def research(client: OpenAI, target_info: str, question: str = "", retriever=Non
     refined_evidence: List[Dict[str, str]] = []
     for i, item in enumerate(ev):
         raw_txt = item.get("text", "")
-        refined_txt = _refine_evidence_text(client, query, raw_txt)
+        # 动态透传模型参数
+        refined_txt = _refine_evidence_text(client, query, raw_txt, model=model_name)
         
         source = item.get("source", "unknown")
         title = item.get("title", "No Title")

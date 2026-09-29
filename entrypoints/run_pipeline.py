@@ -7,6 +7,8 @@ Role:
 
 ** ABLATION SUPPORT ADDED **
 Supports --no-rag and --no-completion flags.
+** UNIFIED MODEL ARCHITECTURE **
+Reports are strictly segregated by GLOBAL_AGENT_MODEL to prevent cross-contamination during resume.
 """
 
 import os
@@ -29,7 +31,6 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-# 现在环境变量配置好了，可以安全导入 core 模块了
 from core.trace_logger import write_jsonl, write_text
 from core.orchestrator import run_pipeline
 from core.answer_agent import check_accuracy
@@ -128,16 +129,21 @@ def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str], use_rag:
     if not use_completion:
         ablation_tag += "_NO_COMPLETION"
 
-    prefix = f"benchmark_eval_{subset}{ablation_tag}_"
+    # 将动态模型名称加入报告文件前缀，防止断点续跑时跨模型污染
+    global_model = os.environ.get("GLOBAL_AGENT_MODEL", "default_model")
+    safe_model_name = global_model.replace("/", "_").replace("-", "_")
+    prefix = f"benchmark_eval_{subset}_{safe_model_name}{ablation_tag}_"
+    
     existing_files = [f for f in os.listdir(output_dir) if f.startswith(prefix) and f.endswith(".csv")]
     
     results = []
     processed_ids = set()
     
+    # 断点续跑逻辑：寻找当前模型、当前配置下的最新文件
     if existing_files:
         existing_files.sort()
         output_csv = os.path.join(output_dir, existing_files[-1])
-        print(f"\n🔄 [RESUME MODE] Found existing report: {output_csv}")
+        print(f"\n🔄 [RESUME MODE] Found existing report for model [{global_model}]: {output_csv}")
         try:
             existing_df = pd.read_csv(output_csv)
             if "Question_ID" in existing_df.columns:
@@ -161,7 +167,7 @@ def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str], use_rag:
         out_df = pd.DataFrame(results)
     else:
         print(f"\n🚀 [BENCHMARK MODE] Evaluating {len(remaining_df)} remaining questions (Sequential & Safe)...")
-        print(f"🔧 Ablation Settings: Use RAG = {use_rag}, Use Completion = {use_completion}")
+        print(f"🔧 Model: {global_model} | RAG = {use_rag} | Completion = {use_completion}")
         checkpoint_every = int(checkpoint_every or 5)
 
         for idx, row in tqdm(remaining_df.iterrows(), total=len(remaining_df), desc="Running Benchmarks"):
@@ -228,6 +234,7 @@ def run_benchmark_mode(subset: str, limit: int, ids_str: Optional[str], use_rag:
             
             results.append(rec)
 
+            # HPC 断点续存保护：每 checkpoint_every 条保存一次
             if (idx + 1) % checkpoint_every == 0:
                 pd.DataFrame(results).to_csv(output_csv, index=False, encoding="utf-8-sig")
 
@@ -262,7 +269,6 @@ def run_inference_mode(csv_path: str, limit: int, use_rag: bool, use_completion:
         logging.error("The provided CSV is empty.")
         return
 
-    # 规范化处理输入 CSV 的 ID 列名，防止后续重复添加 Question_ID
     if "Question ID" in df_questions.columns:
         df_questions["Question_ID"] = df_questions["Question ID"]
     elif "Question_ID" not in df_questions.columns:
@@ -281,12 +287,19 @@ def run_inference_mode(csv_path: str, limit: int, use_rag: bool, use_completion:
     if not use_completion:
         ablation_tag += "_NO_COMPLETION"
 
-    output_csv = os.path.join(output_dir, f"{base_name}{ablation_tag}_results.csv")
+    # 将动态模型名称加入推断报告前缀，并加入断点续跑时间戳支持
+    global_model = os.environ.get("GLOBAL_AGENT_MODEL", "default_model")
+    safe_model_name = global_model.replace("/", "_").replace("-", "_")
+    prefix = f"{base_name}_{safe_model_name}{ablation_tag}_"
+    
+    existing_files = [f for f in os.listdir(output_dir) if f.startswith(prefix) and f.endswith(".csv")]
 
     results = []
     processed_ids = set()
 
-    if os.path.exists(output_csv):
+    if existing_files:
+        existing_files.sort()
+        output_csv = os.path.join(output_dir, existing_files[-1])
         print(f"\n🔄 [RESUME MODE] Found existing output CSV: {output_csv}")
         try:
             existing_df = pd.read_csv(output_csv)
@@ -296,6 +309,11 @@ def run_inference_mode(csv_path: str, limit: int, use_rag: bool, use_completion:
                 print(f"   Already processed {len(processed_ids)} questions. Resuming...")
         except Exception as e:
             logging.warning(f"Could not load existing CSV for resume: {e}")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_csv = os.path.join(output_dir, f"{prefix}{timestamp}.csv")
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_csv = os.path.join(output_dir, f"{prefix}{timestamp}.csv")
 
     remaining_df = df_questions[~df_questions["Question_ID"].astype(str).isin(processed_ids)].reset_index(drop=True)
 
@@ -304,7 +322,7 @@ def run_inference_mode(csv_path: str, limit: int, use_rag: bool, use_completion:
         return
 
     print(f"\n🚀 [INFERENCE MODE] Evaluating {len(remaining_df)} remaining questions from CSV (Sequential & Safe)...")
-    print(f"🔧 Ablation Settings: Use RAG = {use_rag}, Use Completion = {use_completion}")
+    print(f"🔧 Model: {global_model} | RAG = {use_rag} | Completion = {use_completion}")
     checkpoint_every = int(checkpoint_every or 5)
 
     for idx, row in tqdm(remaining_df.iterrows(), total=len(remaining_df), desc="Running Inference"):
@@ -350,14 +368,11 @@ def run_inference_mode(csv_path: str, limit: int, use_rag: bool, use_completion:
 
         t_total = time.time() - t_start
 
-        # 清理并规范字典字段，确保不会有多余/冲突的重复列
         rec = row.to_dict()
         
-        # 将原始可能叫 'Answer' 的基准列自动重命名为标准化的 'Ground_Truth_Answer'
         if "Answer" in rec and "Ground_Truth_Answer" not in rec:
             rec["Ground_Truth_Answer"] = rec.pop("Answer")
             
-        # 移除可能由上面逻辑带来的重复 Question_ID（保留原本的 Question ID）
         if "Question ID" in rec and "Question_ID" in rec:
             del rec["Question_ID"]
 
@@ -404,23 +419,14 @@ def main():
 
     args = parser.parse_args()
 
-    openai_key = os.environ.get("OPENAI_API_KEY")
-    google_key = os.environ.get("GOOGLE_API_KEY")
-
-    missing_keys = []
-    if not openai_key:
-        missing_keys.append("OPENAI_API_KEY")
-    if not google_key:
-        missing_keys.append("GOOGLE_API_KEY")
-
-    if missing_keys:
+    # 安全检查：不再强制检查商业 API Key，而是提醒设置全局模型环境变量
+    global_model = os.environ.get("GLOBAL_AGENT_MODEL")
+    if not global_model:
         print("\n" + "=" * 70)
-        print("❌ [CRITICAL ERROR] Pre-flight Check Failed!")
-        print("=" * 70)
-        for key in missing_keys:
-            print(f"   - {key}")
-        print("\nPlease set both environment variables before starting.")
-        sys.exit(1)
+        print("⚠️ [WARNING] GLOBAL_AGENT_MODEL is not set!")
+        print("   The system will default to 'gpt-4o' or hardcoded fallbacks.")
+        print("   For strict ablation studies, please set this environment variable.")
+        print("=" * 70 + "\n")
 
     use_rag = not args.no_rag
     use_completion = not args.no_completion

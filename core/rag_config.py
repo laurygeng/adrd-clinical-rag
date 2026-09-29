@@ -1,4 +1,4 @@
-# rag_config.py
+# core/rag_config.py
 import os
 import warnings
 
@@ -41,9 +41,6 @@ class RAGConfig:
     # 3. Reranking Parameters (advanced_retriever.py)
     # ==========================================
     rerank_enabled = True
-    # rerank_model_name = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
-    # rerank_model_name = 'cross-encoder/ms-marco-MiniLM-L-12-v2' # 维持较快速度的重排模型
-    # rag_config.py
     
     rerank_model_name = 'BAAI/bge-reranker-v2-m3'
     rerank_max_chars = 1000   # max chars of each passage fed to the cross-encoder
@@ -77,16 +74,14 @@ class RAGConfig:
         return RAGConfig._rerank_device_cache
 
     # ==========================================
-    # 4. LLM & Evaluation Parameters (llm_utils.py)
+    # 4. LLM & Evaluation Parameters
     # ==========================================
-    llm_eval_model = "gpt-4o"
-    llm_rewrite_model = "gpt-4o"
-    llm_gap_model = "gpt-4o-mini"   # cheap model to turn "what's missing" into a targeted query
+    # NOTE: In the Unified Architecture, generative LLM model names are no longer hardcoded here.
+    # The system dynamically reads `os.environ.get("GLOBAL_AGENT_MODEL")` to route all Agent
+    # interactions (Critic, Search, Answer) to the exact same local model for fair ablation.
 
     # Sufficiency gate: unified Identify-then-Verify (ItV) for both TF and MC.
-    # (NLI over-triggers on inferential TF: 43 flags vs ItV 24; ItV AUC 0.694 > NLI 0.675.)
-    tf_gate = "itv"            # best-AUC gate: ItV for TF (0.694) AND MC (0.731), beating NLI (0.675).
-                               # Clean-baseline run with the highest-AUC evaluator on both types.
+    tf_gate = "itv"            
     nli_model = "cross-encoder/nli-deberta-v3-base"
     nli_suff_threshold = 0.5
     itv_n = 5                  # ItV self-consistency runs
@@ -110,10 +105,10 @@ class RAGConfig:
     # 5. Web fallback retrieval (FREE, research-only)
     # ==========================================
     web_enabled = True
-    web_tf_enabled = False   # web fallback NET-NEGATIVE on TF (flips binary judgments); MC only. gap-local still runs for TF.
-    web_max_rounds = 2          # (agentic multi-round supports up to N; 3 broadening gave no gain on DDG)
-    web_per_query_k = 5         # (8 + open domains broadening gave no gain on DDG — reverted)
-    agentic_web_enabled = False # reflective gap-targeted queries; off until a stronger search backend
+    web_tf_enabled = False      # web fallback NET-NEGATIVE on TF (flips binary judgments); MC only. gap-local still runs for TF.
+    web_max_rounds = 2          
+    web_per_query_k = 5         
+    agentic_web_enabled = False 
     web_timeout_sec = 20
     web_sleep_sec = 0.2
     web_cache_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../knowledge_base/web_cache"))
@@ -139,13 +134,6 @@ class RAGConfig:
     web_trigger_min_local_passages = 3
 
     # Domain policy for web fallback:
-    #   "allowlist" = only fetch from web_allow_domains (strict, original behavior)
-    #   "blocklist" = fetch from ANY domain except web_block_domains (open; rely on the
-    #                 cross-encoder rerank to reject topically-irrelevant noise)
-    # Curated allowlist. Full-open "blocklist" mode was tested both before and after the
-    # web-quality filters and gave no net gain (the DuckDuckGo backend is the limiter, not
-    # the domain set — see experiments log). Kept "blocklist" available for when a stronger
-    # search backend is wired in.
     web_domain_mode = "allowlist"
     web_block_domains = [
         # social / UGC
@@ -158,9 +146,7 @@ class RAGConfig:
         "pinterest.co.uk",
     ]
 
-    # TF web-verification gate: when a TF verdict IS reached but its confidence is below
-    # this level, still trigger web verification + re-judge (instead of trusting it blindly).
-    # One of: "high" | "medium" | "low". "high" => verify everything not high-confidence.
+    # TF web-verification gate
     tf_web_verify_below = "high"
 
     web_allow_domains = [
@@ -174,20 +160,18 @@ class RAGConfig:
         "alzheimers.gov",
         "en.wikipedia.org",
         "www.ncbi.nlm.nih.gov",
-        "mayoclinic.org",       # 梅奥诊所（照护指南极佳）
+        "mayoclinic.org",       # 梅奥诊所
         "clevelandclinic.org",  # 克利夫兰医学中心
         "hopkinsmedicine.org",  # 约翰霍普金斯
         "alzdiscovery.org",     # 阿尔茨海默症药物发现基金会
         "dementia.org",         # 痴呆症专题宣教网站
-        # Curated reputable caregiving/health additions (vetted from the open-domain run):
         "alzheimers.org.uk",    # Alzheimer's Society UK
         "dementiauk.org",       # Dementia UK
         "nccdp.org",            # National Council of Certified Dementia Practitioners
-        "nia.nih.gov",          # National Institute on Aging
-        "agingcare.com",        # 照护问答（编辑审核）
-        "dailycaring.com",      # 照护实操（编辑审核）
-        "verywellhealth.com",   # 医学审核科普
-        "healthline.com",       # 医学审核科普
+        "agingcare.com",        
+        "dailycaring.com",      
+        "verywellhealth.com",   
+        "healthline.com",       
         "nhs.uk",               # UK National Health Service
         "caregiver.org",        # Family Caregiver Alliance
     ]

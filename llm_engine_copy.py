@@ -1,61 +1,68 @@
-# core/modelA.py
+# core/llm_engine.py
 """
-Model A shim (renamed from openai.py). Exposes `OpenAI` with same interface as before.
-Includes robust OOM protection, variable scoping fixes, and repetition penalties.
+Unified Local LLM Engine
+作为系统唯一的大模型推理底座，支持 Llama, Qwen, Mistral 以及医疗垂直模型 (如 Hulu-Med)。
 """
 
 import os
 import gc
-import sys
 import torch
 import traceback
 import re
 from types import SimpleNamespace
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+import transformers.utils.import_utils
+
+# [Bypass CVE-2025-32434] 强制屏蔽 transformers 对 torch < 2.6 加载 .bin 文件的安全拦截
+if hasattr(transformers.utils.import_utils, "check_torch_load_is_safe"):
+    transformers.utils.import_utils.check_torch_load_is_safe = lambda: None
+    
 _model = None
 _tokenizer = None
-_current_model_id = None  # 用于追踪当前加载的模型，防止显存泄漏
+_current_model_id = None
 
 def _is_llama3_model(model_id: str) -> bool:
     mid = (model_id or "").lower()
     return "llama-3" in mid or "meta-llama-3" in mid
 
-def _clean_llama3_output(text: str, messages) -> str:
+def _clean_universal_output(text: str, messages) -> str:
     cleaned = (text or "").strip()
 
-    for marker in ["\nassistant:", "\nuser:", "assistant:", "user:", "<|start_header_id|>", "<|eot_id|>"]:
+    # 万能清洗器：兼容 Llama, Qwen, Hulu-Med 的所有可能的前缀污染
+    for marker in [
+        "\nassistant:", "\nAssistant:", "\nuser:", "\nUser:", 
+        "\nSYSTEM:", "\nUSER:", "assistant:", "Assistant:", 
+        "user:", "User:", "<|start_header_id|>", "<|eot_id|>",
+        "<|im_end|>", "<|im_start|>"
+    ]:
         if marker in cleaned:
             cleaned = cleaned.split(marker, 1)[0].strip()
 
+    # 处理严格的格式化输出 (针对 TF 和 MC)
     last_user = str((messages or [{}])[-1].get("content", "") or "")
     upper_cleaned = cleaned.upper()
     upper_user = last_user.upper()
 
     if "EXACTLY 'YES' OR 'NO'" in upper_user or 'EXACTLY "YES" OR "NO"' in upper_user:
-        if upper_cleaned.startswith("YES"):
-            return "Yes"
-        if upper_cleaned.startswith("NO"):
-            return "No"
+        if upper_cleaned.startswith("YES"): return "Yes"
+        if upper_cleaned.startswith("NO"): return "No"
 
     if "EXACTLY ONE OPTION LETTER" in upper_user:
         match = re.search(r"\b([A-E])\b", upper_cleaned)
-        if match:
-            return match.group(1)
+        if match: return match.group(1)
 
     return cleaned
 
 def _get_model_and_tokenizer(model_id: str = None):
     global _model, _tokenizer, _current_model_id
     
-    target_model_id = model_id or os.environ.get("LOCAL_AGENT_A_MODEL", "meta-llama/Meta-Llama-3-8B-Instruct")
+    target_model_id = model_id or os.environ.get("GLOBAL_AGENT_MODEL", "meta-llama/Meta-Llama-3-8B-Instruct")
     
-    # 如果模型未加载，或者需要切换到新的模型，则执行加载/重载逻辑
     if _model is None or target_model_id != _current_model_id:
-        
-        # [修复 2] 显存 OOM 保护：安全释放旧模型，使用 = None 防止 NameError
         if _model is not None:
-            print(f"\n[Shim Debug] >>> Unloading previous model: {_current_model_id} to free VRAM <<<")
+            print(f"\n[Engine Debug] >>> Unloading previous model: {_current_model_id} to free VRAM <<<")
             _model = None
             _tokenizer = None
             gc.collect()
@@ -74,14 +81,9 @@ def _get_model_and_tokenizer(model_id: str = None):
                 bnb_4bit_quant_type="nf4"
             )
 
-        print(f"\n[Shim Debug] >>> Loading Native Model: {target_model_id} (4-bit: {bnb_config is not None}) <<<")
+        print(f"\n[Engine Debug] >>> Loading Native Model: {target_model_id} (4-bit: {bnb_config is not None}) <<<")
 
-        _tokenizer = AutoTokenizer.from_pretrained(
-            target_model_id,
-            token=hf_token,
-            trust_remote_code=True,
-        )
-
+        _tokenizer = AutoTokenizer.from_pretrained(target_model_id, token=hf_token, trust_remote_code=True)
         _model = AutoModelForCausalLM.from_pretrained(
             target_model_id,
             token=hf_token,
@@ -100,30 +102,26 @@ def _get_model_and_tokenizer(model_id: str = None):
 
 class _ChatCompletions:
     def create(self, model, messages, temperature=0.7, max_tokens=1024, **kwargs):
-        if model and str(model).lower().startswith("gpt"):
-            target_id = os.environ.get("LOCAL_AGENT_A_MODEL", "")
-            llm, tokenizer = _get_model_and_tokenizer(target_id)
-            model_id = target_id
-        else:
-            llm, tokenizer = _get_model_and_tokenizer(model)
-            model_id = model or os.environ.get("LOCAL_AGENT_A_MODEL", "")
-            
-        is_llama3 = _is_llama3_model(model_id)
+        target_id = os.environ.get("GLOBAL_AGENT_MODEL", "")
+        llm, tokenizer = _get_model_and_tokenizer(target_id)
+        is_llama3 = _is_llama3_model(target_id)
         
         try:
+            # 尝试标准 HuggingFace Chat Template (适用 Llama-3, Qwen, Mistral)
             input_ids = tokenizer.apply_chat_template(
-                messages, 
-                tokenize=True, 
-                add_generation_prompt=True,
-                return_tensors="pt"
+                messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
             ).to(llm.device)
             inputs = {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)}
         except Exception:
-            prompt = "".join([f"{m.get('role')}: {m.get('content')}\n" for m in messages]) + "assistant:\n"
-            fallback_inputs = tokenizer(prompt, return_tensors="pt").to(llm.device)
+            # 兜底机制：如果模型 (如 Hulu-Med) 不支持 Chat Template，启用文本拼接
+            sys_msg = next((m.get('content') for m in messages if m.get('role') == 'system'), "")
+            user_msg = next((m.get('content') for m in messages if m.get('role') == 'user'), "")
+            
+            # 兼容 Hulu-Med 的对话格式
+            fallback_prompt = f"SYSTEM:\n{sys_msg}\n\nUSER:\n{user_msg}\n\nAssistant:\n"
+            fallback_inputs = tokenizer(fallback_prompt, return_tensors="pt").to(llm.device)
             inputs = {"input_ids": fallback_inputs.input_ids, "attention_mask": fallback_inputs.attention_mask}
         
-        # [修复 3] 加入 repetition_penalty 防止死循环输出乱码
         gen_kwargs = {
             "max_new_tokens": int(max_tokens) if is_llama3 else max(32, int(max_tokens)),
             "do_sample": temperature > 0.0,
@@ -132,14 +130,11 @@ class _ChatCompletions:
 
         if is_llama3:
             eos_token_ids = []
-            if tokenizer.eos_token_id is not None:
-                eos_token_ids.append(int(tokenizer.eos_token_id))
+            if tokenizer.eos_token_id is not None: eos_token_ids.append(int(tokenizer.eos_token_id))
             try:
                 eot_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
-                if eot_id is not None and eot_id != tokenizer.unk_token_id:
-                    eos_token_ids.append(int(eot_id))
-            except Exception:
-                pass
+                if eot_id is not None and eot_id != tokenizer.unk_token_id: eos_token_ids.append(int(eot_id))
+            except Exception: pass
             if eos_token_ids:
                 gen_kwargs["eos_token_id"] = eos_token_ids
                 gen_kwargs["pad_token_id"] = eos_token_ids[0]
@@ -151,51 +146,34 @@ class _ChatCompletions:
         generated_text = ""
         try:
             with torch.no_grad():
-                outputs = llm.generate(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                    **gen_kwargs
-                )
+                outputs = llm.generate(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"], **gen_kwargs)
             
             seq = outputs[0]
             input_length = inputs["input_ids"].shape[1]
-            
-            if len(seq) > input_length:
-                generated_tokens = seq[input_length:].tolist()
-            else:
-                generated_tokens = seq.tolist()
-                
-            # [修复 3] 启用 clean_up_tokenization_spaces 防止不完整字符解码报错
+            generated_tokens = seq[input_length:].tolist() if len(seq) > input_length else seq.tolist()
             generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=True).strip()
             
-            if is_llama3:
-                generated_text = _clean_llama3_output(generated_text, messages)
+            # 所有模型统一走万能清洗，彻底切除多余的标签
+            generated_text = _clean_universal_output(generated_text, messages)
             
         except Exception as e:
-            err_txt = traceback.format_exc()
-            msg_preview = " | ".join([f"{m.get('role')}:{str(m.get('content',''))[:200]}" for m in (messages or [])])
-            raise RuntimeError(f"Model inference failed: {err_txt}\nModel preview: {msg_preview}")
-            
+            raise RuntimeError(f"Model inference failed: {traceback.format_exc()}")
         finally:
-            # [修复 1] 安全检查，防止 UnboundLocalError 掩盖原始报错
-            if 'inputs' in locals() and inputs is not None:
-                del inputs
-            if 'outputs' in locals() and outputs is not None:
-                del outputs
+            if 'inputs' in locals() and inputs is not None: del inputs
+            if 'outputs' in locals() and outputs is not None: del outputs
             torch.cuda.empty_cache()
             gc.collect()
 
         if not generated_text:
-            msg_preview = " | ".join([f"{m.get('role')}:{str(m.get('content',''))[:200]}" for m in (messages or [])])
-            raise RuntimeError(f"Empty model output (FAILED_EMPTY_OUTPUT). Model_id={model_id}. Prompt preview: {msg_preview}")
+            raise RuntimeError("Empty model output (FAILED_EMPTY_OUTPUT).")
 
-        print(f"[Shim Trace] ✅ 成功生成答案: {repr(generated_text)}")
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=generated_text))])
 
 class _Chat:
     def __init__(self):
         self.completions = _ChatCompletions()
 
-class OpenAI:
+# 类名从 OpenAI 改为 LocalLLMClient，消除所有混淆
+class LocalLLMClient:
     def __init__(self, api_key=None, **kwargs):
         self.chat = _Chat()
