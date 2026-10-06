@@ -6,7 +6,7 @@ Centralized run-scoped logging utilities.
 Creates:
   logs/<RUN_TS>/critic/*.md
   logs/<RUN_TS>/critic/critic_traces.jsonl
-  logs/<RUN_TS>/orchestrator/pipeline_traces.jsonl
+  logs/<RUN_TS>/orchestrator/pipeline_traces__<MODEL>__<QTYPE>.jsonl
 """
 
 import os
@@ -19,16 +19,18 @@ _LOCK = threading.Lock()
 _RUN_TS: Optional[str] = None
 _RUN_DIR: Optional[str] = None
 
+
 def get_project_root() -> str:
     # core/trace_logger.py -> project_root/core/trace_logger.py
     return os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
+
 def get_run_ts() -> str:
     global _RUN_TS
     if _RUN_TS is None:
-        # Keep stable for whole process
         _RUN_TS = datetime.now().strftime("%Y%m%d_%H%M%S")
     return _RUN_TS
+
 
 def get_run_dir() -> str:
     global _RUN_DIR
@@ -38,13 +40,14 @@ def get_run_dir() -> str:
         os.makedirs(_RUN_DIR, exist_ok=True)
     return _RUN_DIR
 
+
 def ensure_subdir(name: str) -> str:
     d = os.path.join(get_run_dir(), name)
     os.makedirs(d, exist_ok=True)
     return d
 
-def _safe_filename(s: str, max_len: int = 120) -> str:
-    # make filesystem-friendly
+
+def safe_filename(s: str, max_len: int = 120) -> str:
     keep = []
     for ch in (s or ""):
         if ch.isalnum() or ch in ("-", "_", "."):
@@ -58,13 +61,14 @@ def _safe_filename(s: str, max_len: int = 120) -> str:
         out = out[:max_len]
     return out or "item"
 
+
 def make_item_id(question_id: Optional[str], question: str) -> str:
     if question_id:
-        return _safe_filename(question_id)
-    # fallback: short hash prefix
+        return safe_filename(question_id)
     import hashlib
     h = hashlib.md5((question or "").encode("utf-8")).hexdigest()[:10]
     return f"Q_{h}"
+
 
 def write_jsonl(subdir: str, filename: str, obj: Dict[str, Any]) -> str:
     d = ensure_subdir(subdir)
@@ -75,6 +79,7 @@ def write_jsonl(subdir: str, filename: str, obj: Dict[str, Any]) -> str:
             f.write(line + "\n")
     return path
 
+
 def write_text(subdir: str, filename: str, text: str) -> str:
     d = ensure_subdir(subdir)
     path = os.path.join(d, filename)
@@ -82,6 +87,7 @@ def write_text(subdir: str, filename: str, text: str) -> str:
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
     return path
+
 
 def write_run_meta(meta: Dict[str, Any]) -> str:
     path = os.path.join(get_run_dir(), "run_meta.json")

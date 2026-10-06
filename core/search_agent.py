@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
 """
 Search Agent (Free & Medical-Focused: EuropePMC + DuckDuckGo)
-Role: Generates a targeted medical search query based on missing info and original question,
-and retrieves external evidence using completely free backends (EuropePMC medical database + DuckDuckGo).
-
-This module returns STRUCTURED evidence items:
-  {"source": str, "title": str, "url": str, "text": str}
+with detailed debug logging.
 """
 
 import os
 import re
+import logging
 import requests
 from typing import List, Dict, Tuple
 from core.llm_engine import LocalLLMClient
 
-# Try importing duckduckgo_search if available
 try:
     from duckduckgo_search import DDGS
     HAS_DDGS = True
@@ -22,13 +18,58 @@ except ImportError:
     HAS_DDGS = False
 
 UA = {"User-Agent": "adrd-medical-rag/2.0"}
+logger = logging.getLogger(__name__)
+
+
+def _dbg_enabled() -> bool:
+    return os.environ.get("HULU_DEBUG", "1") == "1"
+
+
+def _clip_text(x: str, limit: int = 800) -> str:
+    s = str(x or "")
+    if len(s) <= limit:
+        return s
+    return s[:limit] + f" ...[truncated {len(s) - limit} chars]"
+
+
+def _dbg(stage: str, **kwargs) -> None:
+    if not _dbg_enabled():
+        return
+    payload = " | ".join(f"{k}={_clip_text(v)}" for k, v in kwargs.items())
+    logger.warning(f"[HULU-DEBUG][search][{stage}] {payload}")
+
+
+_UNKNOWN_PATTERNS = [
+    r"\bi\s*don't\s*know\b",
+    r"\bi\s*do\s*not\s*know\b",
+    r"\bnot\s+enough\s+(?:information|info)\b",
+    r"\binsufficient\s+(?:information|info)\b",
+    r"\bcannot\s+determine\b",
+    r"\bcan't\s+determine\b",
+    r"\bunable\s+to\s+determine\b",
+    r"\bbased\s+on\s+the\s+provided\s+context\b",
+    r"\b不知道\b",
+    r"\b信息不足\b",
+    r"\b无法判断\b",
+    r"\b无法确定\b",
+]
+
+
+def _looks_unknown(text: str) -> bool:
+    t = str(text or "").strip().lower()
+    if not t:
+        return True
+    for p in _UNKNOWN_PATTERNS:
+        if re.search(p, t, flags=re.IGNORECASE):
+            return True
+    return False
 
 
 def clean_search_query_text(text: str, fallback: str = "") -> str:
     raw = str(text or "").replace("\r\n", "\n").strip()
     fb = str(fallback or "").replace("\r\n", "\n").strip()
 
-    if not raw:
+    if not raw or _looks_unknown(raw):
         raw = fb
 
     raw = re.sub(r"```.*?```", " ", raw, flags=re.S)
@@ -43,6 +84,8 @@ def clean_search_query_text(text: str, fallback: str = "") -> str:
         line = line.strip().strip("-*•`\"'")
         if not line:
             continue
+        if _looks_unknown(line):
+            continue
         if re.match(r"(?i)^\(note[:\)]", line):
             continue
         if re.match(r"(?i)^(here('| i)?s|this query|note:|answer:|context:|question:|statement:)\b", line):
@@ -54,15 +97,20 @@ def clean_search_query_text(text: str, fallback: str = "") -> str:
     cleaned = re.sub(r"\s+", " ", cleaned).strip().strip("\"'")
     cleaned = cleaned[:160].strip()
 
-    if len(cleaned) < 3:
+    if len(cleaned) < 3 or _looks_unknown(cleaned):
         cleaned = re.sub(r"\s+", " ", fb).strip().strip("\"'")[:160]
 
     return cleaned
 
 
+def _rule_fallback_query(target_info: str, question: str = "") -> str:
+    base = clean_search_query_text(target_info, fallback=question)
+    if not base:
+        base = clean_search_query_text(question, fallback="dementia clinical facts")
+    return base[:160]
+
+
 def _generate_query(client: LocalLLMClient, target_info: str, question: str = "", model: str = "gpt-4o", q_type: str = "MC") -> str:
-    """Generate a precise medical search query combining question context and target info."""
-    
     if str(q_type).strip().upper() == "QA":
         prompt = (
             "You are a medical research assistant. Given a target missing fact and the original question, "
@@ -84,7 +132,9 @@ def _generate_query(client: LocalLLMClient, target_info: str, question: str = ""
             f"Original Question: {question}\n"
             f"Missing Target Info: {target_info}\nQuery:"
         )
-    
+
+    fallback_query = _rule_fallback_query(target_info=target_info, question=question)
+    _dbg("generate_query_prompt", q_type=q_type, target_info=target_info, fallback_query=fallback_query, prompt=_clip_text(prompt, 1200))
     try:
         r = client.chat.completions.create(
             model=model,
@@ -92,14 +142,20 @@ def _generate_query(client: LocalLLMClient, target_info: str, question: str = ""
             max_tokens=40,
             messages=[{"role": "user", "content": prompt}],
         )
-        q = clean_search_query_text(r.choices[0].message.content or "", fallback=target_info)
-        return q if q else clean_search_query_text(target_info, fallback=target_info)
-    except Exception:
-        return clean_search_query_text(target_info, fallback=target_info)
+        raw = (r.choices[0].message.content or "").strip()
+        if _looks_unknown(raw):
+            _dbg("generate_query_unknown", raw=raw, fallback_query=fallback_query)
+            return fallback_query
+        q = clean_search_query_text(raw, fallback=fallback_query)
+        final_q = q if q and not _looks_unknown(q) else fallback_query
+        _dbg("generate_query_result", raw=raw, cleaned=q, final_query=final_q)
+        return final_q
+    except Exception as e:
+        _dbg("generate_query_error", error=str(e), fallback_query=fallback_query)
+        return fallback_query
 
 
 def _refine_evidence_text(client: LocalLLMClient, query: str, raw_text: str, model: str = "gpt-4o") -> str:
-    """Knowledge Refinement: Extract relevant sentences but preserve context."""
     if not raw_text or len(raw_text) < 20:
         return ""
     prompt = (
@@ -107,6 +163,7 @@ def _refine_evidence_text(client: LocalLLMClient, query: str, raw_text: str, mod
         "Discard unrelated chit-chat or website navigation, but KEEP the full context of the relevant medical facts. Do NOT over-compress.\n\n"
         f"Text:\n{raw_text[:1200]}\n\nExtracted Facts:"
     )
+    _dbg("refine_evidence_prompt", query=query, raw_text_preview=_clip_text(raw_text, 1000))
     try:
         r = client.chat.completions.create(
             model=model,
@@ -114,8 +171,14 @@ def _refine_evidence_text(client: LocalLLMClient, query: str, raw_text: str, mod
             max_tokens=250,
             messages=[{"role": "user", "content": prompt}],
         )
-        return (r.choices[0].message.content or "").strip()
-    except Exception:
+        txt = (r.choices[0].message.content or "").strip()
+        if not txt or _looks_unknown(txt):
+            _dbg("refine_evidence_fallback_raw", refined=txt, raw_preview=_clip_text(raw_text, 500))
+            return raw_text[:400]
+        _dbg("refine_evidence_result", refined_preview=_clip_text(txt, 800))
+        return txt
+    except Exception as e:
+        _dbg("refine_evidence_error", error=str(e), raw_preview=_clip_text(raw_text, 500))
         return raw_text[:400]
 
 
@@ -181,19 +244,16 @@ def _local_fallback(query: str, retriever) -> List[Dict[str, str]]:
 
 
 def research(client: LocalLLMClient, target_info: str, question: str = "", retriever=None, q_type: str = "MC", model_name: str = "gpt-4o") -> Tuple[List[Dict[str, str]], str, str]:
-    """
-    Execute a free, medical-focused external search (EuropePMC -> DuckDuckGo -> Local Fallback)
-    with query contextualization and LLM-based evidence refinement.
-    """
     log_lines = ["\n## Completion Retrieval (Web Search) Log\n"]
-    
-    # 动态透传模型参数
+
+    _dbg("research_begin", target_info=target_info, question_preview=_clip_text(question, 1000), q_type=q_type, model_name=model_name)
     query = _generate_query(client, target_info, question=question, model=model_name, q_type=q_type)
+    if _looks_unknown(query):
+        query = _rule_fallback_query(target_info=target_info, question=question)
     log_lines.append(f"- **Generated Search Query**: `{query}`")
 
     ev: List[Dict[str, str]] = []
-    
-    # 1. EuropePMC
+
     try:
         epmc = _europepmc(query, 3)
         if epmc:
@@ -204,7 +264,6 @@ def research(client: LocalLLMClient, target_info: str, question: str = "", retri
     except Exception as e:
         log_lines.append(f"- **EuropePMC ERROR**: {str(e)}")
 
-    # 2. DuckDuckGo
     if not ev:
         log_lines.append("- Falling back to DuckDuckGo...")
         try:
@@ -217,7 +276,6 @@ def research(client: LocalLLMClient, target_info: str, question: str = "", retri
         except Exception as e:
             log_lines.append(f"- **DuckDuckGo ERROR**: {str(e)}")
 
-    # 3. Local Fallback
     if not ev:
         log_lines.append("- Falling back to Local Retrieval...")
         try:
@@ -230,27 +288,37 @@ def research(client: LocalLLMClient, target_info: str, question: str = "", retri
         except Exception as e:
             log_lines.append(f"- **Local Fallback ERROR**: {str(e)}")
 
-    # 4. Refinement
     log_lines.append("\n### LLM Evidence Refinement (Noise Filtering)\n")
     refined_evidence: List[Dict[str, str]] = []
     for i, item in enumerate(ev):
         raw_txt = item.get("text", "")
-        # 动态透传模型参数
         refined_txt = _refine_evidence_text(client, query, raw_txt, model=model_name)
-        
+
         source = item.get("source", "unknown")
         title = item.get("title", "No Title")
         url = item.get("url", "No URL")
-        
-        if refined_txt:
+
+        if refined_txt and not _looks_unknown(refined_txt):
             refined_evidence.append({
-                "source": source, "title": title, "url": url, "text": refined_txt
+                "source": source,
+                "title": title,
+                "url": url,
+                "text": refined_txt,
             })
             log_lines.append(f"- ✅ **[KEPT]** Item {i+1} | Source: `{source}` | Title: *{title[:50]}...* | URL: {url}")
+        elif raw_txt:
+            refined_evidence.append({
+                "source": source,
+                "title": title,
+                "url": url,
+                "text": raw_txt[:400],
+            })
+            log_lines.append(f"- ✅ **[KEPT_RAW]** Item {i+1} | Source: `{source}` | Title: *{title[:50]}...* | URL: {url}")
         else:
-            log_lines.append(f"- ❌ **[DROPPED]** Item {i+1} | Source: `{source}` | Reason: LLM found no directly relevant facts.")
+            log_lines.append(f"- ❌ **[DROPPED]** Item {i+1} | Source: `{source}` | Reason: no usable text.")
 
     final_ev = refined_evidence if refined_evidence else ev
     log_lines.append(f"\n- **Final Evidence Count**: Returned {len(final_ev)} item(s) to Orchestrator.\n")
+    _dbg("research_end", query=query, evidence_count=len(final_ev), first_evidence_preview=_clip_text((final_ev[0].get("text", "") if final_ev else ""), 500))
 
     return final_ev, query, "\n".join(log_lines)

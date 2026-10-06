@@ -1,56 +1,104 @@
 #!/usr/bin/env python3
-"""
-Pre-download specified HF models (tokenizers + model weights) into the HuggingFace cache.
-
-Usage:
-  export HUGGINGFACE_HUB_TOKEN="<your-token>"
-  python scripts/pull_models.py
-
-Optional env vars:
-  HF_MODEL_CACHE_DIR - path to use as `cache_dir` for transformers downloads.
-"""
+import argparse
 import os
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from pathlib import Path
 
-MODELS = [
-    "meta-llama/Meta-Llama-3-8B-Instruct",
-    # 提醒：如果 HuluMed-7B 是 HF 上的线上模型，你需要加上作者前缀，比如 "xxx/HuluMed-7B"。
-    # 如果它是本地路径，这步可能会报找不到 repo 的错，你可以先把它从列表里注释掉。
-    "HuluMed-7B",
-]
+from huggingface_hub import snapshot_download
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Pull one or more Hugging Face models into a local cache directory.")
+    p.add_argument(
+        "models",
+        nargs="+",
+        help="One or more Hugging Face model IDs, e.g. BioMistral/BioMistral-7B-DARE or mistralai/Mistral-7B-Instruct-v0.3",
+    )
+    p.add_argument(
+        "--base-dir",
+        default="./downloaded_models",
+        help="Base directory for downloaded models (default: ./downloaded_models)",
+    )
+    p.add_argument(
+        "--token",
+        default=os.environ.get("HUGGINGFACE_HUB_TOKEN") or os.environ.get("HF_TOKEN"),
+        help="HF token. If omitted, uses HUGGINGFACE_HUB_TOKEN or HF_TOKEN from env.",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Force re-download even if target directory already exists and is non-empty.",
+    )
+    p.add_argument(
+        "--allow-pattern",
+        action="append",
+        default=None,
+        help="Optional allow pattern(s) forwarded to snapshot_download. Can be repeated.",
+    )
+    p.add_argument(
+        "--ignore-pattern",
+        action="append",
+        default=None,
+        help="Optional ignore pattern(s) forwarded to snapshot_download. Can be repeated.",
+    )
+    return p.parse_args()
+
+
+def safe_local_name(model_id: str) -> str:
+    return model_id.replace("/", "__")
+
+
+def is_nonempty_dir(path: Path) -> bool:
+    return path.exists() and path.is_dir() and any(path.iterdir())
+
+
+def pull_one_model(model_id: str, base_dir: Path, token: str = None, force: bool = False, allow_patterns=None, ignore_patterns=None):
+    local_dir = base_dir / safe_local_name(model_id)
+
+    if is_nonempty_dir(local_dir) and not force:
+        print(f"[SKIP] {model_id} already exists at: {local_dir}")
+        return str(local_dir)
+
+    local_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[PULL] Downloading {model_id} -> {local_dir}")
+
+    snapshot_download(
+        repo_id=model_id,
+        local_dir=str(local_dir),
+        local_dir_use_symlinks=False,
+        token=token,
+        allow_patterns=allow_patterns,
+        ignore_patterns=ignore_patterns,
+        resume_download=True,
+    )
+
+    print(f"[DONE] {model_id} -> {local_dir}")
+    return str(local_dir)
+
 
 def main():
-    cache_dir = os.environ.get("HF_MODEL_CACHE_DIR")
-    # 提取环境变量中的 Token
-    hf_token = os.environ.get("HUGGINGFACE_HUB_TOKEN") 
-    
-    print("HF cache dir:", cache_dir or "(default)")
-    if not hf_token:
-        print("⚠️ Warning: HUGGINGFACE_HUB_TOKEN is not set. Downloading gated models will fail.")
+    args = parse_args()
+    base_dir = Path(args.base_dir).resolve()
+    base_dir.mkdir(parents=True, exist_ok=True)
 
-    for m in MODELS:
-        print(f"\nDownloading model: {m}")
+    print(f"Base directory: {base_dir}")
+    if args.token:
+        print("HF token: detected")
+    else:
+        print("HF token: not set (public models only / lower rate limits)")
+
+    for model_id in args.models:
         try:
-            # 将 token=hf_token 传入
-            AutoTokenizer.from_pretrained(
-                m, 
-                use_fast=False, 
-                cache_dir=cache_dir,
-                token=hf_token 
+            pull_one_model(
+                model_id=model_id,
+                base_dir=base_dir,
+                token=args.token,
+                force=args.force,
+                allow_patterns=args.allow_pattern,
+                ignore_patterns=args.ignore_pattern,
             )
-            # 将 token=hf_token 传入
-            AutoModelForCausalLM.from_pretrained(
-                m, 
-                low_cpu_mem_usage=True, 
-                cache_dir=cache_dir, 
-                trust_remote_code=True,
-                token=hf_token
-            )
-            print(f"  ✓ {m} downloaded")
         except Exception as e:
-            print(f"  ✗ Failed to download {m}: {e}")
+            print(f"[ERROR] Failed to pull {model_id}: {e}")
 
-    print("\nAll done.")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

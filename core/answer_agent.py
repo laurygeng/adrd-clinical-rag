@@ -146,7 +146,7 @@ def _extract_mc_answer(text: str, question: str = "") -> str:
     if match:
         return match.group(1).upper()
 
-    # 4) Search formatted occurrences (avoid article "A" false positives by requiring formatting)
+    # 4) Search formatted occurrences
     match = re.search(r"(?i)\boption\s+([A-E])\b|\b([A-E])\.(?=\s|$)|(?<=\s)\(([A-E])\)", raw)
     if match:
         return (match.group(1) or match.group(2) or match.group(3)).upper()
@@ -176,10 +176,6 @@ def _extract_mc_answer(text: str, question: str = "") -> str:
 # Capability routing
 # -----------------------------------------------------------------------------
 def _detect_has_chat_template(model_name: str) -> bool:
-    """Best-effort capability detection.
-
-    Reuse llm_engine's tokenizer; if anything fails, default to base-mode (more robust for small/base models).
-    """
     try:
         from core.llm_engine import _get_model_and_tokenizer, _has_chat_template
         _, tokenizer = _get_model_and_tokenizer(model_name)
@@ -192,7 +188,6 @@ def _detect_has_chat_template(model_name: str) -> bool:
 # Decision-only retries (MC/TF)
 # -----------------------------------------------------------------------------
 def _mc_decision_only_call(client, target_model: str, context: str, question: str, max_tokens: int = 4) -> str:
-    """Second-stage MC: force the model to output ONLY one letter."""
     prompt = (
         "You are a multiple-choice answer selector.\n"
         "Return ONLY a single letter: A, B, C, D, or E.\n"
@@ -213,7 +208,6 @@ def _mc_decision_only_call(client, target_model: str, context: str, question: st
 
 
 def _tf_decision_only_call(client, target_model: str, context: str, question: str, max_tokens: int = 4) -> str:
-    """Second-stage TF: force ONLY Yes/No."""
     prompt = (
         "Return ONLY one token: Yes or No.\n"
         "Do NOT output any other text.\n\n"
@@ -236,13 +230,11 @@ def _tf_decision_only_call(client, target_model: str, context: str, question: st
 # Main entry
 # -----------------------------------------------------------------------------
 def generate_final_answer(client, question: str, context: str, q_type: str, model_name: str = None) -> str:
-    """Generates the final answer based on the provided final context."""
     target_model = model_name or os.environ.get("GLOBAL_AGENT_MODEL", "gpt-4o")
     q_type_u = str(q_type or "").strip().upper()
 
     has_chat = _detect_has_chat_template(target_model)
 
-    # Keep system prompt minimal; base models may ignore it anyway.
     if q_type_u == "QA":
         system_prompt = (
             "You are a supportive expert assistant for dementia caregivers. "
@@ -254,11 +246,7 @@ def generate_final_answer(client, question: str, context: str, q_type: str, mode
 
     context_block = f"--- Retrieved Context ---\n{context}\n\n"
 
-    # -------------------------
-    # Prompt routing
-    # -------------------------
     if not has_chat:
-        # Base-model channel: completion-friendly minimal formatting.
         if q_type_u == "TF":
             user_content = (
                 f"{context_block}"
@@ -271,7 +259,7 @@ def generate_final_answer(client, question: str, context: str, q_type: str, mode
             user_content = (
                 f"{context_block}"
                 f"Question: {question}\n"
-                "Answer with exactly ONE letter: A, B, C, D, or E.\n"
+                "Provide the correct option letter (A, B, C, D, or E) based on the context.\n"
                 "Answer:"
             )
             target_max_tokens = 16
@@ -284,7 +272,6 @@ def generate_final_answer(client, question: str, context: str, q_type: str, mode
             )
             target_max_tokens = 240
     else:
-        # Instruct/chat channel: richer constraints + small examples.
         instructions = (
             "--- INSTRUCTIONS ---\n"
             "1. GROUNDING: Answer STRICTLY based on the provided context above. Do NOT use outside knowledge.\n"
@@ -295,20 +282,11 @@ def generate_final_answer(client, question: str, context: str, q_type: str, mode
                 "--- EXAMPLES ---\n"
                 "Question: True or False statement: All apples are red.\n"
                 "Final Answer: No\n\n"
-                "Question: True or False statement: Physical activity is beneficial for cardiovascular health.\n"
-                "Final Answer: Yes\n\n"
             )
             target_max_tokens = 20
         elif q_type_u == "MC":
             instructions += (
                 "2. FORMAT: Output EXACTLY ONE option letter (A, B, C, D, or E). No explanation.\n\n"
-                "--- EXAMPLES ---\n"
-                "Question: What color can apples be?\n"
-                "Options:\n"
-                "  A. Blue\n"
-                "  B. Red and Green\n"
-                "  C. Yellow\n"
-                "Final Answer: B\n\n"
             )
             target_max_tokens = 30
         else:
@@ -323,9 +301,6 @@ def generate_final_answer(client, question: str, context: str, q_type: str, mode
             "Final Answer: "
         )
 
-    # -------------------------
-    # LLM execution + strict parsing + decision-only retries
-    # -------------------------
     def _call(max_tokens: int):
         return _chat_with_retry(
             client=client,
@@ -348,20 +323,18 @@ def generate_final_answer(client, question: str, context: str, q_type: str, mode
             if parsed:
                 return parsed
 
-            # Decision-only retry 1
             raw2 = _tf_decision_only_call(client, target_model, context=context, question=question, max_tokens=4)
             parsed2 = _extract_yesno_answer(raw2)
             if parsed2:
                 return parsed2
 
-            # Decision-only retry 2 (even shorter)
             raw3 = _tf_decision_only_call(client, target_model, context=context, question=question, max_tokens=2)
             parsed3 = _extract_yesno_answer(raw3)
             if parsed3:
                 return parsed3
 
             logging.warning(f"[TF_PARSE_FAIL] raw='{raw_output}' raw2='{raw2}' raw3='{raw3}'")
-            return "No"
+            return "No"  # 降级返回 No
 
         # ---- MC ----
         if q_type_u == "MC":
@@ -369,26 +342,24 @@ def generate_final_answer(client, question: str, context: str, q_type: str, mode
             if parsed:
                 return parsed
 
-            # Decision-only retry 1
             raw2 = _mc_decision_only_call(client, target_model, context=context, question=question, max_tokens=4)
             parsed2 = _extract_mc_answer(raw2, question=question)
             if parsed2:
                 return parsed2
 
-            # Decision-only retry 2 (even shorter)
             raw3 = _mc_decision_only_call(client, target_model, context=context, question=question, max_tokens=2)
             parsed3 = _extract_mc_answer(raw3, question=question)
             if parsed3:
                 return parsed3
 
             logging.warning(f"[MC_PARSE_FAIL] raw='{raw_output}' raw2='{raw2}' raw3='{raw3}'")
-            return "A"
+            # 【修复点】：不要盲目返回 A，改为返回空或者 C（或者交由模型自由输出，这里返回 "" 让评测判错，而不是制造伪造的 A）
+            return ""
 
         # ---- QA ----
         if raw_output:
             return raw_output
 
-        # QA retry with more budget
         response2 = _call(max(96, target_max_tokens))
         raw2 = (response2.choices[0].message.content or "").strip()
         return raw2 or "I don't know based on the provided context."
@@ -398,12 +369,11 @@ def generate_final_answer(client, question: str, context: str, q_type: str, mode
         if q_type_u == "TF":
             return "No"
         if q_type_u == "MC":
-            return "A"
+            return ""
         return f"Error: {e}"
 
 
 def check_accuracy(generated: str, ground_truth: str, correct_letter: str, q_type: str) -> bool:
-    """Objective scoring tool. Intended for calculating accuracy during pipeline batch runs."""
     generated_clean = (generated or "").strip().upper()
     if not generated_clean:
         return False
@@ -419,7 +389,6 @@ def check_accuracy(generated: str, ground_truth: str, correct_letter: str, q_typ
         return generated_clean == gt
 
     if q_type_u == "MC":
-        # Extractor guarantees single letter if working; fallback returns A anyway.
         return generated_clean == (correct_letter or "").strip().upper()
 
     if q_type_u == "QA":
