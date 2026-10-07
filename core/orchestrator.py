@@ -21,19 +21,7 @@ from core.answer_agent import generate_final_answer
 from core.integration_agent import assemble_context
 from core.trace_logger import write_jsonl, make_item_id, get_run_dir
 
-
-import threading
-from pathlib import Path
-
 # 导入自动归档脚本
-try:
-    from core.archive_web_context_to_kb import archive_evidence_records
-    ARCHIVE_AVAILABLE = True
-except ImportError:
-    ARCHIVE_AVAILABLE = False
-    logging.warning("⚠️ archive_web_context_to_kb module not found. Web archiving disabled.")
-
-# 导入你的自动归档脚本
 try:
     from core.archive_web_context_to_kb import archive_evidence_records
     ARCHIVE_AVAILABLE = True
@@ -109,31 +97,6 @@ def _trigger_async_archiving(question_id: str, question: str, retrieval_query: s
 
     def archive_task():
         try:
-            # 定位到 knowledge_base/raw_files/web_external 目录
-            base_dir = Path(__file__).resolve().parents[1] / "knowledge_base" / "raw_files" / "web_external"
-            record = {
-                "question_id": question_id,
-                "question": question,
-                "retrieval_query": retrieval_query,
-                "q_type": q_type,
-                "evidence": web_evidence
-            }
-            stats = archive_evidence_records([record], base_dir)
-            if stats.get('items_saved', 0) > 0:
-                logging.info(f"✅ Async Archiving: Saved {stats['items_saved']} new external knowledge docs to {base_dir}")
-        except Exception as e:
-            logging.error(f"❌ Async Archiving Failed: {e}")
-
-    # 使用守护线程在后台执行，不阻塞主流程
-    threading.Thread(target=archive_task, daemon=True).start()
-    
-# --- 异步自动归档函数 ---
-def _trigger_async_archiving(question_id: str, question: str, retrieval_query: str, q_type: str, web_evidence: list):
-    if not ARCHIVE_AVAILABLE or not web_evidence:
-        return
-
-    def archive_task():
-        try:
             base_dir = Path(__file__).resolve().parents[1] / "knowledge_base" / "raw_files" / "web_external"
             record = {
                 "question_id": question_id,
@@ -145,7 +108,7 @@ def _trigger_async_archiving(question_id: str, question: str, retrieval_query: s
             # 这里是纯文本写硬盘操作，速度极快，且因为在独立线程，绝不阻塞你的系统
             stats = archive_evidence_records([record], base_dir)
             if stats.get('items_saved', 0) > 0:
-                logging.info(f"✅ Async Archiving: Saved {stats['items_saved']} new external docs")
+                logging.info(f"✅ Async Archiving: Saved {stats['items_saved']} new external docs to {base_dir}")
         except Exception as e:
             logging.error(f"❌ Async Archiving Failed: {e}")
 

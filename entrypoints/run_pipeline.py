@@ -437,6 +437,14 @@ def main():
     else:
         run_benchmark_mode(args.subset, args.limit, args.ids, use_rag=use_rag, use_completion=use_completion, checkpoint_every=checkpoint_every)
 
+    print("\n🔄 Triggering Automatic Knowledge Base Ingestion...")
+    try:
+        from core.ingest_web_kb import ingest_archived_web_docs
+        ingest_archived_web_docs()
+    except ImportError:
+        print("⚠️ Could not import ingest_archived_web_docs. Make sure core/ingest_web_kb.py exists.")
+    except Exception as e:
+        print(f"❌ Auto-ingestion failed: {e}")
 
 if __name__ == "__main__":
     main()
