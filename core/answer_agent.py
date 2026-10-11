@@ -333,8 +333,10 @@ def generate_final_answer(client, question: str, context: str, q_type: str, mode
             if parsed3:
                 return parsed3
 
+            # logging.warning(f"[TF_PARSE_FAIL] raw='{raw_output}' raw2='{raw2}' raw3='{raw3}'")
+            # return "No"  # 降级返回 No
             logging.warning(f"[TF_PARSE_FAIL] raw='{raw_output}' raw2='{raw2}' raw3='{raw3}'")
-            return "No"  # 降级返回 No
+            return ""
 
         # ---- MC ----
         if q_type_u == "MC":

@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Search Agent (Free & Medical-Focused: EuropePMC + DuckDuckGo)
-with detailed debug logging.
+Features: Parallel Hybrid Retrieval, Multi-Gap Support, Concurrent LLM Refinement, and Pure Markdown Tracing.
 """
 
 import os
 import re
 import logging
 import requests
+import concurrent.futures
 from typing import List, Dict, Tuple
 from core.llm_engine import LocalLLMClient
 
@@ -20,50 +21,18 @@ except ImportError:
 UA = {"User-Agent": "adrd-medical-rag/2.0"}
 logger = logging.getLogger(__name__)
 
-
-def _dbg_enabled() -> bool:
-    return os.environ.get("HULU_DEBUG", "1") == "1"
-
-
-def _clip_text(x: str, limit: int = 800) -> str:
-    s = str(x or "")
-    if len(s) <= limit:
-        return s
-    return s[:limit] + f" ...[truncated {len(s) - limit} chars]"
-
-
-def _dbg(stage: str, **kwargs) -> None:
-    if not _dbg_enabled():
-        return
-    payload = " | ".join(f"{k}={_clip_text(v)}" for k, v in kwargs.items())
-    logger.warning(f"[HULU-DEBUG][search][{stage}] {payload}")
-
-
 _UNKNOWN_PATTERNS = [
-    r"\bi\s*don't\s*know\b",
-    r"\bi\s*do\s*not\s*know\b",
-    r"\bnot\s+enough\s+(?:information|info)\b",
-    r"\binsufficient\s+(?:information|info)\b",
-    r"\bcannot\s+determine\b",
-    r"\bcan't\s+determine\b",
-    r"\bunable\s+to\s+determine\b",
-    r"\bbased\s+on\s+the\s+provided\s+context\b",
-    r"\b不知道\b",
-    r"\b信息不足\b",
-    r"\b无法判断\b",
-    r"\b无法确定\b",
+    r"\bi\s*don't\s*know\b", r"\bi\s*do\s*not\s*know\b", r"\bnot\s+enough\s+(?:information|info)\b",
+    r"\binsufficient\s+(?:information|info)\b", r"\bcannot\s+determine\b", r"\bcan't\s+determine\b",
+    r"\bunable\s+to\s+determine\b", r"\bbased\s+on\s+the\s+provided\s+context\b",
 ]
-
 
 def _looks_unknown(text: str) -> bool:
     t = str(text or "").strip().lower()
-    if not t:
-        return True
+    if not t: return True
     for p in _UNKNOWN_PATTERNS:
-        if re.search(p, t, flags=re.IGNORECASE):
-            return True
+        if re.search(p, t, flags=re.IGNORECASE): return True
     return False
-
 
 def clean_search_query_text(text: str, fallback: str = "") -> str:
     raw = str(text or "").replace("\r\n", "\n").strip()
@@ -82,14 +51,10 @@ def clean_search_query_text(text: str, fallback: str = "") -> str:
     parts = []
     for line in raw.splitlines():
         line = line.strip().strip("-*•`\"'")
-        if not line:
-            continue
-        if _looks_unknown(line):
-            continue
-        if re.match(r"(?i)^\(note[:\)]", line):
-            continue
-        if re.match(r"(?i)^(here('| i)?s|this query|note:|answer:|context:|question:|statement:)\b", line):
-            continue
+        if not line: continue
+        if _looks_unknown(line): continue
+        if re.match(r"(?i)^\(note[:\)]", line): continue
+        if re.match(r"(?i)^(here('| i)?s|this query|note:|answer:|context:|question:|statement:)\b", line): continue
         parts.append(line)
 
     cleaned = parts[0] if parts else raw
@@ -102,13 +67,11 @@ def clean_search_query_text(text: str, fallback: str = "") -> str:
 
     return cleaned
 
-
 def _rule_fallback_query(target_info: str, question: str = "") -> str:
     base = clean_search_query_text(target_info, fallback=question)
     if not base:
         base = clean_search_query_text(question, fallback="dementia clinical facts")
     return base[:160]
-
 
 def _generate_query(client: LocalLLMClient, target_info: str, question: str = "", model: str = "gpt-4o", q_type: str = "MC") -> str:
     if str(q_type).strip().upper() == "QA":
@@ -134,191 +97,189 @@ def _generate_query(client: LocalLLMClient, target_info: str, question: str = ""
         )
 
     fallback_query = _rule_fallback_query(target_info=target_info, question=question)
-    _dbg("generate_query_prompt", q_type=q_type, target_info=target_info, fallback_query=fallback_query, prompt=_clip_text(prompt, 1200))
     try:
         r = client.chat.completions.create(
-            model=model,
-            temperature=0.0,
-            max_tokens=40,
-            messages=[{"role": "user", "content": prompt}],
+            model=model, temperature=0.0, max_tokens=40, messages=[{"role": "user", "content": prompt}]
         )
         raw = (r.choices[0].message.content or "").strip()
-        if _looks_unknown(raw):
-            _dbg("generate_query_unknown", raw=raw, fallback_query=fallback_query)
-            return fallback_query
+        if _looks_unknown(raw): return fallback_query
         q = clean_search_query_text(raw, fallback=fallback_query)
-        final_q = q if q and not _looks_unknown(q) else fallback_query
-        _dbg("generate_query_result", raw=raw, cleaned=q, final_query=final_q)
-        return final_q
-    except Exception as e:
-        _dbg("generate_query_error", error=str(e), fallback_query=fallback_query)
+        return q if q and not _looks_unknown(q) else fallback_query
+    except Exception:
         return fallback_query
 
-
 def _refine_evidence_text(client: LocalLLMClient, query: str, raw_text: str, model: str = "gpt-4o") -> str:
-    if not raw_text or len(raw_text) < 20:
-        return ""
+    if not raw_text or len(raw_text) < 20: return ""
     prompt = (
         f"Extract the specific paragraphs and clinical facts from the text below that directly answer or verify: '{query}'. "
         "Discard unrelated chit-chat or website navigation, but KEEP the full context of the relevant medical facts. Do NOT over-compress.\n\n"
         f"Text:\n{raw_text[:1200]}\n\nExtracted Facts:"
     )
-    _dbg("refine_evidence_prompt", query=query, raw_text_preview=_clip_text(raw_text, 1000))
     try:
         r = client.chat.completions.create(
-            model=model,
-            temperature=0.0,
-            max_tokens=250,
-            messages=[{"role": "user", "content": prompt}],
+            model=model, temperature=0.0, max_tokens=250, messages=[{"role": "user", "content": prompt}]
         )
         txt = (r.choices[0].message.content or "").strip()
-        if not txt or _looks_unknown(txt):
-            _dbg("refine_evidence_fallback_raw", refined=txt, raw_preview=_clip_text(raw_text, 500))
-            return raw_text[:400]
-        _dbg("refine_evidence_result", refined_preview=_clip_text(txt, 800))
+        if not txt or _looks_unknown(txt): return raw_text[:400]
         return txt
-    except Exception as e:
-        _dbg("refine_evidence_error", error=str(e), raw_preview=_clip_text(raw_text, 500))
+    except Exception:
         return raw_text[:400]
 
-
-def _europepmc(query: str, n: int = 3) -> List[Dict[str, str]]:
+def _europepmc(query: str, n: int = 2) -> List[Dict[str, str]]:
     med_query = query if "dementia" in query.lower() or "alzheimer" in query.lower() else f"{query} dementia"
     params = {"query": med_query, "format": "json", "pageSize": n, "resultType": "core"}
-    d = requests.get(
-        "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
-        params=params,
-        headers=UA,
-        timeout=10,
-    ).json()
+    try:
+        d = requests.get("https://www.ebi.ac.uk/europepmc/webservices/rest/search", params=params, headers=UA, timeout=10).json()
+        out = []
+        for x in (d.get("resultList", {}) or {}).get("result", []) or []:
+            title = (x.get("title") or "").strip()
+            text = x.get("abstractText") or x.get("title") or ""
+            text = re.sub(r"<[^>]+>", " ", text).strip()
+            src = (x.get("source") or "").strip()
+            pid = (x.get("id") or "").strip()
+            url = f"https://europepmc.org/article/{src}/{pid}" if src and pid else ""
+            if text: out.append({"source": "europepmc", "title": title, "url": url, "text": text[:800]})
+        return out
+    except Exception:
+        return []
 
-    out: List[Dict[str, str]] = []
-    for x in (d.get("resultList", {}) or {}).get("result", []) or []:
-        title = (x.get("title") or "").strip()
-        text = x.get("abstractText") or x.get("title") or ""
-        text = re.sub(r"<[^>]+>", " ", text).strip()
-
-        src = (x.get("source") or "").strip()
-        pid = (x.get("id") or "").strip()
-        url = f"https://europepmc.org/article/{src}/{pid}" if src and pid else ""
-
-        if text:
-            out.append({"source": "europepmc", "title": title, "url": url, "text": text[:800]})
-    return out
-
-
-def _duckduckgo(query: str, n: int = 3) -> List[Dict[str, str]]:
-    if not HAS_DDGS:
-        raise RuntimeError("duckduckgo_search library is not installed.")
+def _duckduckgo(query: str, n: int = 2) -> List[Dict[str, str]]:
+    if not HAS_DDGS: return []
     out = []
-    with DDGS() as ddgs:
-        results = [r for r in ddgs.text(query, max_results=n)]
-        for res in results:
-            body = (res.get("body") or "").strip()
-            if not body:
-                continue
-            out.append({
-                "source": "duckduckgo",
-                "title": (res.get("title") or "").strip(),
-                "url": (res.get("href") or "").strip(),
-                "text": body[:800],
-            })
+    try:
+        with DDGS() as ddgs:
+            results = [r for r in ddgs.text(query, max_results=n)]
+            for res in results:
+                body = (res.get("body") or "").strip()
+                if not body: continue
+                out.append({"source": "duckduckgo", "title": (res.get("title") or "").strip(), "url": (res.get("href") or "").strip(), "text": body[:800]})
+    except Exception:
+        pass
     return out
-
 
 def _local_fallback(query: str, retriever) -> List[Dict[str, str]]:
-    if retriever is None:
-        raise ValueError("No local retriever provided for fallback.")
-    wp, _, _ = retriever.get_retrieved_passages(
-        query,
-        top_k=6,
-        pre_k=20,
-        window_size=500,
-    )
-    out: List[Dict[str, str]] = []
-    for p in wp[:10]:
-        text = (p or "").strip()
-        if text:
-            out.append({"source": "local_fallback", "title": "", "url": "", "text": text})
-    return out
-
+    if retriever is None: return []
+    try:
+        wp, _, _ = retriever.get_retrieved_passages(query, top_k=4, pre_k=20, window_size=500)
+        out = []
+        for p in wp[:4]:
+            text = (p or "").strip()
+            if text: out.append({"source": "local_fallback", "title": "", "url": "", "text": text})
+        return out
+    except Exception:
+        return []
 
 def research(client: LocalLLMClient, target_info: str, question: str = "", retriever=None, q_type: str = "MC", model_name: str = "gpt-4o") -> Tuple[List[Dict[str, str]], str, str]:
+    # Start capturing steps for the MD file
     log_lines = ["\n## Completion Retrieval (Web Search) Log\n"]
+    logger.info("Search Agent started: Suppressing console debugs, routing details to MD trace.")
+    
+    # 1. Split Multiple Gaps and Generate Queries Concurrently
+    raw_gaps = [g.strip() for g in target_info.split("|") if g.strip()]
+    if not raw_gaps: raw_gaps = [target_info]
+    
+    queries = []
+    log_lines.append("### Query Generation")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(raw_gaps), 3)) as executor:
+        future_to_gap = {executor.submit(_generate_query, client, g, question, model_name, q_type): g for g in raw_gaps}
+        for future in concurrent.futures.as_completed(future_to_gap):
+            original_gap = future_to_gap[future]
+            q = future.result()
+            if q:
+                queries.append(q)
+                log_lines.append(f"- **Gap**: `{original_gap}` ➔ **LLM Query**: `{q}`")
+            
+    queries = list(set(queries))
+    if not queries: 
+        queries = [_rule_fallback_query(target_info, question)]
+        log_lines.append(f"- **Fallback Triggered**: `{queries[0]}`")
 
-    _dbg("research_begin", target_info=target_info, question_preview=_clip_text(question, 1000), q_type=q_type, model_name=model_name)
-    query = _generate_query(client, target_info, question=question, model=model_name, q_type=q_type)
-    if _looks_unknown(query):
-        query = _rule_fallback_query(target_info=target_info, question=question)
-    log_lines.append(f"- **Generated Search Query**: `{query}`")
+    # 2. Parallel Hybrid Search
+    # log_lines.append("\n### Search Execution")
+    # raw_evidence = []
+    # with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+    #     search_futures = []
+    #     for q in queries:
+    #         search_futures.append(executor.submit(_europepmc, q, 2))
+    #         if HAS_DDGS: search_futures.append(executor.submit(_duckduckgo, q, 2))
+            
+    #     for future in concurrent.futures.as_completed(search_futures):
+    #         res = future.result()
+    #         if res: raw_evidence.extend(res)
+    
+    # 2. Parallel Hybrid Search
+    log_lines.append("\n### Search Execution")
+    raw_evidence = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        search_futures = []
+        
+        # 照护类/生活类词汇库
+        care_keywords = ["care", "home", "clothing", "behavior", "agitation", "sleep", "dressing", "eat", "daily", "supervision", "diet", "driving", "financial"]
+        
+        for q in queries:
+            q_lower = q.lower()
+            is_care_query = any(k in q_lower for k in care_keywords)
+            
+            # 核心策略：如果是照护细节题，压制 EuropePMC(学术文献降为1)，增加 DuckDuckGo(通俗网页升为3)
+            epmc_limit = 1 if is_care_query else 2
+            ddg_limit = 3 if is_care_query else 2
+            
+            search_futures.append(executor.submit(_europepmc, q, epmc_limit))
+            if HAS_DDGS: 
+                search_futures.append(executor.submit(_duckduckgo, q, ddg_limit))
 
-    ev: List[Dict[str, str]] = []
+    # Deduplicate
+    unique_evidence = []
+    seen_urls, seen_texts = set(), set()
+    for item in raw_evidence:
+        url = item.get("url", "")
+        text_hash = item.get("text", "")[:100].lower()
+        if url and url in seen_urls: continue
+        if text_hash and text_hash in seen_texts: continue
+        if url: seen_urls.add(url)
+        if text_hash: seen_texts.add(text_hash)
+        unique_evidence.append(item)
 
-    try:
-        epmc = _europepmc(query, 3)
-        if epmc:
-            log_lines.append(f"- **EuropePMC**: Found {len(epmc)} results.")
-            ev.extend(epmc)
-        else:
-            log_lines.append("- **EuropePMC**: Found 0 results.")
-    except Exception as e:
-        log_lines.append(f"- **EuropePMC ERROR**: {str(e)}")
+    if not unique_evidence:
+        log_lines.append("- **Web Search Yielded 0 Results**. Triggering Local Fallback...")
+        for q in queries:
+            loc_res = _local_fallback(q, retriever)
+            unique_evidence.extend(loc_res)
+    else:
+        log_lines.append(f"- Retrieved {len(unique_evidence)} unique items from external sources.")
 
-    if not ev:
-        log_lines.append("- Falling back to DuckDuckGo...")
-        try:
-            ddg = _duckduckgo(query, 3)
-            if ddg:
-                log_lines.append(f"- **DuckDuckGo**: Found {len(ddg)} results.")
-                ev.extend(ddg)
-            else:
-                log_lines.append("- **DuckDuckGo**: Found 0 results.")
-        except Exception as e:
-            log_lines.append(f"- **DuckDuckGo ERROR**: {str(e)}")
-
-    if not ev:
-        log_lines.append("- Falling back to Local Retrieval...")
-        try:
-            loc = _local_fallback(query, retriever)
-            if loc:
-                log_lines.append(f"- **Local Fallback**: Found {len(loc)} results.")
-                ev.extend(loc)
-            else:
-                log_lines.append("- **Local Fallback**: Found 0 results.")
-        except Exception as e:
-            log_lines.append(f"- **Local Fallback ERROR**: {str(e)}")
-
-    log_lines.append("\n### LLM Evidence Refinement (Noise Filtering)\n")
-    refined_evidence: List[Dict[str, str]] = []
-    for i, item in enumerate(ev):
+    # 3. Parallel LLM Evidence Refinement
+    log_lines.append("\n### LLM Evidence Refinement (Noise Filtering)")
+    refined_evidence = []
+    
+    def _refine_task(idx, item, q_list):
+        combined_q = " OR ".join(q_list)
         raw_txt = item.get("text", "")
-        refined_txt = _refine_evidence_text(client, query, raw_txt, model=model_name)
-
         source = item.get("source", "unknown")
         title = item.get("title", "No Title")
         url = item.get("url", "No URL")
+        refined_txt = _refine_evidence_text(client, combined_q, raw_txt, model=model_name)
+        return idx, source, title, url, raw_txt, refined_txt
 
-        if refined_txt and not _looks_unknown(refined_txt):
-            refined_evidence.append({
-                "source": source,
-                "title": title,
-                "url": url,
-                "text": refined_txt,
-            })
-            log_lines.append(f"- ✅ **[KEPT]** Item {i+1} | Source: `{source}` | Title: *{title[:50]}...* | URL: {url}")
-        elif raw_txt:
-            refined_evidence.append({
-                "source": source,
-                "title": title,
-                "url": url,
-                "text": raw_txt[:400],
-            })
-            log_lines.append(f"- ✅ **[KEPT_RAW]** Item {i+1} | Source: `{source}` | Title: *{title[:50]}...* | URL: {url}")
-        else:
-            log_lines.append(f"- ❌ **[DROPPED]** Item {i+1} | Source: `{source}` | Reason: no usable text.")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        refine_futures = [executor.submit(_refine_task, i, item, queries) for i, item in enumerate(unique_evidence)]
+        for future in concurrent.futures.as_completed(refine_futures):
+            idx, source, title, url, raw_txt, refined_txt = future.result()
+            if refined_txt and not _looks_unknown(refined_txt):
+                refined_evidence.append({"source": source, "title": title, "url": url, "text": refined_txt, "idx": idx})
+                log_lines.append(f"- ✅ **[KEPT]** Source: `{source}` | URL: {url}")
+            elif raw_txt:
+                refined_evidence.append({"source": source, "title": title, "url": url, "text": raw_txt[:400], "idx": idx})
+                log_lines.append(f"- ⚠️ **[KEPT_RAW]** Source: `{source}` | Reason: LLM refinement failed or bypassed.")
+            else:
+                log_lines.append(f"- ❌ **[DROPPED]** Source: `{source}` | Reason: Empty or invalid text.")
 
-    final_ev = refined_evidence if refined_evidence else ev
-    log_lines.append(f"\n- **Final Evidence Count**: Returned {len(final_ev)} item(s) to Orchestrator.\n")
-    _dbg("research_end", query=query, evidence_count=len(final_ev), first_evidence_preview=_clip_text((final_ev[0].get("text", "") if final_ev else ""), 500))
+    # Restore order
+    refined_evidence.sort(key=lambda x: x.get("idx", 0))
+    for item in refined_evidence: item.pop("idx", None)
 
-    return final_ev, query, "\n".join(log_lines)
+    final_ev = refined_evidence if refined_evidence else unique_evidence
+    returned_queries = " | ".join(queries)
+    log_lines.append(f"\n- **Final Verification**: {len(final_ev)} evidence items sent to Integration Agent.\n")
+    
+    return final_ev, returned_queries, "\n".join(log_lines)

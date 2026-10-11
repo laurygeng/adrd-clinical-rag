@@ -169,6 +169,7 @@ def _build_markdown(
 	dom = _domain(url)
 	text = _safe_text(item.get("text"))
 
+	# 1. 将所有溯源信息（包括测试题目）全部沉降到 YAML 元数据中
 	meta = {
 		"source_type": "external_web_retrieval",
 		"retrieval_source": source,
@@ -178,6 +179,7 @@ def _build_markdown(
 		"question_id": question_id,
 		"q_type": q_type,
 		"retrieval_query": retrieval_query,
+		"original_question": question, # 题干存入 metadata，不参与向量嵌入
 		"text_sha256": _sha256(text),
 	}
 
@@ -187,29 +189,15 @@ def _build_markdown(
 		front_matter.append(f"{k}: {json.dumps(vv, ensure_ascii=False)}")
 	front_matter.append("---")
 
+	# 2. 正文 (page_content) 只保留纯粹的临床医学事实
 	body = [
 		f"# {title}",
 		"",
-		"## Provenance",
-		f"- Source type: external_web_retrieval",
-		f"- Retrieval engine: {source}",
-		f"- Source URL: {url or 'N/A'}",
-		f"- Source domain: {dom or 'N/A'}",
-		f"- Retrieved at (UTC): {retrieved_at}",
-		f"- Question ID: {question_id or 'N/A'}",
-		f"- Question type: {q_type or 'N/A'}",
-		f"- Retrieval query: {retrieval_query or 'N/A'}",
-		"",
-		"## Question",
-		question or "N/A",
-		"",
-		"## Extracted/Refined Content",
 		text,
 		"",
 	]
 
 	return "\n".join(front_matter + [""] + body).strip() + "\n"
-
 
 def _dedup_key(item: Dict[str, Any]) -> str:
 	url = _normalize_url(item.get("url") or "")

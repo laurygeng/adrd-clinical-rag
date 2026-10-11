@@ -81,8 +81,16 @@ def generate_web_rewrite_query(statement: str, gap_hint: str = '', q_type: str =
     if str(q_type).strip().upper() == 'QA':
         user_prompt = f'Question: {clean_statement}\nMissing Fact to Find: {gh}\n\nGenerate a highly specific search query (3-7 keywords). CRITICAL: You MUST retain the exact medical conditions, interventions, or specific scenarios mentioned in the question. Do NOT generalize the topic into broad guidelines. Output ONLY the query text without quotes or preamble.'
     else:
-        user_prompt = f'Question: {clean_statement}\nMissing Fact to Find: {gh}\n\nGenerate a short, precise search query (3-7 keywords). CRITICAL RULE: Extract the broad medical concept, intervention, or clinical topic. Do NOT include the specific assertions, restrictive behaviors, or exact claims made in the question, as those may be the myths or false statements being tested. Formulate the query to find the general factual baseline or standard best practices for the topic.\nDo NOT include option letters (A, B, C, D, E). Output ONLY the query text without quotes or preamble.'
-
+        user_prompt = (
+                    f'Question: {clean_statement}\n'
+                    f'Missing Fact to Find: {gh}\n\n'
+                    'Generate a short, precise search query (3-6 keywords). '
+                    'CRITICAL RULE: Extract the core clinical scenario, specific communication phrase, or specific caregiving dilemma from the question. '
+                    'Generate a query targeting this exact specific scenario. '
+                    'Do NOT over-generalize the topic into broad guidelines. '
+                    'Strictly avoid the specific option letters (A, B, C, D, E). '
+                    'Output ONLY the query text without quotes or preamble.'
+                )
     try:
         r = client.chat.completions.create(model=model_name, temperature=0.0, max_tokens=25, messages=[{'role': 'system', 'content': sys_prompt}, {'role': 'user', 'content': user_prompt}])
         query = clean_search_query_text(r.choices[0].message.content or '', fallback=f'{clean_statement} {gh}')
