@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
 Critic Agent (Sufficiency Gate) — Semantic Clustering & Comprehensive Trace Logging
+
+Modified: Included model-specific prompt fallbacks to cure Lingshu_7B's over-skepticism
+and JSON format hallucinations. Added Negative Gap bypass to prevent logic inversion.
 """
 
 import os
@@ -92,9 +95,44 @@ _CRITIC_FORMAT_RULES = (
     "3. Do NOT solve the question or mention option letters."
 )
 
-SYS_ID_MC = f"You judge whether a CONTEXT is sufficient to answer a multiple-choice question. Identify only whether the context is sufficient and, if not, the single most important missing fact needed to determine the correct option. {_CRITIC_FORMAT_RULES}"
-SYS_ID_TF = f"You judge whether a CONTEXT is sufficient to decide if a TRUE/FALSE statement is true or false. Identify only whether the context is sufficient and, if not, the single most important missing fact needed to decide. {_CRITIC_FORMAT_RULES}"
+_IS_LINGSHU = "lingshu" in os.environ.get("GLOBAL_AGENT_MODEL", "").lower()
+
+SYS_ID_MC = (
+    "You are an evaluator. Determine if the context contains enough info to answer the question.\n"
+    "Output valid JSON ONLY. End immediately after the '}'.\n"
+    "{\n"
+    '  "sufficient": true/false,\n'
+    '  "gap": "missing info or NONE"\n'
+    "}"
+) if _IS_LINGSHU else (
+    "You are an expert evaluator. Determine if the provided context contains enough information "
+    "to confidently select the single correct option (A, B, C, D, or E) and confidently eliminate the others.\n\n"
+    "Output ONLY a valid JSON object in the following format:\n"
+    "{\n"
+    '  "sufficient": true/false,\n'
+    '  "gap": "NONE" or "A concise 10-word description of the exact missing fact needed to distinguish the correct option."\n'
+    "}"
+)
+
+SYS_ID_TF = (
+    "You are an evaluator. Determine if the context contains enough info to decide if the statement is true or false.\n"
+    "Output valid JSON ONLY. End immediately after the '}'.\n"
+    "{\n"
+    '  "sufficient": true/false,\n'
+    '  "gap": "missing info or NONE"\n'
+    "}"
+) if _IS_LINGSHU else (
+    "You are an expert evaluator. Determine if the provided context contains enough information "
+    "to confidently decide if the TRUE/FALSE statement is true or false.\n\n"
+    "Output ONLY a valid JSON object in the following format:\n"
+    "{\n"
+    '  "sufficient": true/false,\n'
+    '  "gap": "NONE" or "A concise 10-word description of the exact missing medical fact needed."\n'
+    "}"
+)
+
 SYS_ID_QA = f"You judge whether a CONTEXT is sufficient to answer an open-ended question completely and accurately. Identify only whether the context is sufficient and, if not, the single most important missing fact needed to answer. {_CRITIC_FORMAT_RULES}"
+
 
 _RESCUE_SYS = (
     "You are a sufficiency judge. Output EXACTLY two lines and nothing else:\n"
@@ -132,7 +170,8 @@ def _clean_and_validate_gap(raw_gap: str) -> str:
     gap = re.sub(r"\s+", " ", gap)
     if not gap or gap.upper() == "NONE": return "NONE"
     if re.search(r"(?i)\boption\b", gap) or re.fullmatch(r"[A-E]", gap): return "NONE"
-    if len(gap) > 120 or len(gap.split()) > 15: return "NONE"
+    # 放宽字数限制以适应 Lingshu 的长句子
+    if len(gap) > 160 or len(gap.split()) > 35: return "NONE"
     return gap
 
 def _parse_critic_response(x: str, q_type: str = "QA") -> Dict[str, Any]:
@@ -183,7 +222,8 @@ def _normalize_gap_text(x: str, q_type: str = "QA") -> str:
 
 def _is_valid_gap(x: str, q_type: str = "QA") -> bool:
     t = _normalize_gap_text(x, q_type=q_type)
-    if not t or t == "NONE" or len(t) < 3 or len(t) > 120 or len(t.split()) > 15: return False
+    # 同样放宽这里的字数限制，保持同步
+    if not t or t == "NONE" or len(t) < 3 or len(t) > 160 or len(t.split()) > 35: return False
     if t.endswith("...") or "\n" in t: return False
     if re.search(r"(?i)\b(context|question|statement|answer|explanation)\s*:", t): return False
     if re.search(r"(?i)\b(true or false|option\s+[A-E]|assistant|system|user)\b", t): return False
@@ -209,7 +249,13 @@ def _looks_like_direct_answer(x: str, q_type: str, question: str) -> bool:
 
 def _gap_is_negative(gap: str) -> bool:
     g = (gap or "").strip().lower()
-    neg_markers = ["does not state", "doesn't state", "not stated", "not mentioned", "lacks", "lack of", "missing:", "context does not", "not explicitly"]
+    # [新增修复]: 增加常见的负面和无信息表达，防止二次验证模型被绕晕
+    neg_markers = [
+        "does not state", "doesn't state", "not stated", "not mentioned", 
+        "lacks", "lack of", "missing:", "context does not", "not explicitly",
+        "no clear", "no specific", "does not explicitly", "without more information",
+        "no direct evidence", "fails to"
+    ]
     return any(m in g for m in neg_markers)
 
 def _call_unified_llm(sys_prompt: str, user_prompt: str, temperature: float = 0.3, max_tokens: int = 40, model_override: Optional[str] = None) -> str:
@@ -408,32 +454,46 @@ def evaluate_sufficiency(question: str, context: str, q_type: str = "MC", calls_
     trace["consensus_gap_is_negative"] = any(_gap_is_negative(g) for g in diverse_gaps)
 
     if diverse_gaps and diverse_gaps[0] != "NONE" and retriever is not None and context:
-        trace["verify_mode"] = "locate_reranker"
-        absent_gaps = []
-        best_overall_score, best_overall_span = -1.0, ""
-
-        for g in diverse_gaps:
-            v_res = _verify_locate_with_reranker(retriever, gap=g, context=context, window_sents=int(verify_window_sents), max_spans=int(verify_max_spans), threshold=float(verify_threshold))
-            logger.info(f"Verification | Gap: '{g[:40]}...' | Present: {v_res['present']} | Score: {v_res['best_score']}")
-            
-            if v_res.get("best_score") is not None and v_res["best_score"] > best_overall_score:
-                best_overall_score = v_res["best_score"]
-                best_overall_span = v_res["best_span"]
-                
-            if not v_res["present"]:
-                absent_gaps.append(g)
-        
-        trace["verify_best_score"] = best_overall_score if best_overall_score >= 0 else None
-        trace["verify_threshold"] = float(verify_threshold)
-        trace["verify_best_span"] = best_overall_span
-        trace["verify_window_sents"] = int(verify_window_sents)
-
-        if absent_gaps:
-            final_is_sufficient = False
+        # ==============================================================================
+        # [核心修复]: 拦截负面缺口，直接跳过二次验证，防止逻辑反转误判
+        # ==============================================================================
+        if trace.get("consensus_gap_is_negative"):
+            logger.info("Consensus gap is negative. Bypassing verify_locate to prevent logic inversion.")
+            trace["verify_mode"] = "bypassed_negative"
             trace["verify_label"] = "ABSENT"
+            trace["verify_best_score"] = None
+            trace["verify_threshold"] = float(verify_threshold)
+            trace["verify_best_span"] = ""
+            trace["verify_window_sents"] = int(verify_window_sents)
+            absent_gaps = diverse_gaps
+            final_is_sufficient = False
         else:
-            final_is_sufficient = True
-            trace["verify_label"] = "PRESENT"
+            trace["verify_mode"] = "locate_reranker"
+            absent_gaps = []
+            best_overall_score, best_overall_span = -1.0, ""
+
+            for g in diverse_gaps:
+                v_res = _verify_locate_with_reranker(retriever, gap=g, context=context, window_sents=int(verify_window_sents), max_spans=int(verify_max_spans), threshold=float(verify_threshold))
+                logger.info(f"Verification | Gap: '{g[:40]}...' | Present: {v_res['present']} | Score: {v_res['best_score']}")
+                
+                if v_res.get("best_score") is not None and v_res["best_score"] > best_overall_score:
+                    best_overall_score = v_res["best_score"]
+                    best_overall_span = v_res["best_span"]
+                    
+                if not v_res["present"]:
+                    absent_gaps.append(g)
+            
+            trace["verify_best_score"] = best_overall_score if best_overall_score >= 0 else None
+            trace["verify_threshold"] = float(verify_threshold)
+            trace["verify_best_span"] = best_overall_span
+            trace["verify_window_sents"] = int(verify_window_sents)
+
+            if absent_gaps:
+                final_is_sufficient = False
+                trace["verify_label"] = "ABSENT"
+            else:
+                final_is_sufficient = True
+                trace["verify_label"] = "PRESENT"
     else:
         trace["verify_mode"] = "none"
         trace["verify_label"] = ""

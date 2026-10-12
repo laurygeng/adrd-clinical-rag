@@ -181,12 +181,40 @@ def _remove_special_tokens_artifacts(text: str) -> str:
     return t
 
 
+# def _clean_universal_output(text: str, messages) -> str:
+#     cleaned = (text or "").strip()
+#     cleaned = _strip_leading_role_markers(cleaned)
+#     cleaned = _remove_special_tokens_artifacts(cleaned).strip()
+
+#     # =========================================================================
+#     # [新增修复]: 专门切断 Lingshu 等模型喜欢在 JSON 后边乱加 Assistant: 的循环幻觉
+#     # =========================================================================
+#     if "}Assistant:" in cleaned:
+#         cleaned = cleaned.split("}Assistant:")[0] + "}"
+#     elif "} Assistant:" in cleaned:
+#         cleaned = cleaned.split("} Assistant:")[0] + "}"
+#     elif "}\nAssistant:" in cleaned:
+#         cleaned = cleaned.split("}\nAssistant:")[0] + "}"
+
+#     last_user = ""        
 def _clean_universal_output(text: str, messages) -> str:
     cleaned = (text or "").strip()
     cleaned = _strip_leading_role_markers(cleaned)
     cleaned = _remove_special_tokens_artifacts(cleaned).strip()
 
+    # [终极截断修复]: 寻找第一个左括号和它匹配的右括号，直接切断后续所有幻觉复读
+    # 即便它输出 { ... }{ ... }，我们也只取第一个 { ... }
+    json_match = re.search(r'^(\{.*?\})', cleaned, re.DOTALL)
+    if json_match:
+        cleaned = json_match.group(1).strip()
+    else:
+        # 如果开头不是 {，尝试在文本中寻找
+        json_match_any = re.search(r'(\{.*?\})', cleaned, re.DOTALL)
+        if json_match_any:
+            cleaned = json_match_any.group(1).strip()
+
     last_user = ""
+        
     try:
         for m in reversed(messages or []):
             if isinstance(m, dict) and m.get("role") == "user":
@@ -377,6 +405,13 @@ class _ChatCompletions:
             "do_sample": float(temperature) > 0.0,
             "repetition_penalty": rep,
         }
+
+        # =====================================================================
+        # [新增修复]: 专门针对 Lingshu 等模型的循环切断机制（增加重复惩罚）
+        # =====================================================================
+        target_id_lower = target_id.lower()
+        if "lingshu" in target_id_lower:
+            gen_kwargs["repetition_penalty"] = 1.15
 
         try:
             gen_kwargs["min_new_tokens"] = 1

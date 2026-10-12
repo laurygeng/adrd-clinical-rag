@@ -9,7 +9,8 @@ or a concise factual answer (for open-ended QA). Contains no batch-processing lo
 Hardening:
 - Works for instruct/chat models AND base models (routes by tokenizer chat_template capability).
 - MC/TF outputs are ALWAYS forced into valid format (A-E / Yes-No) via decision-only retries + parsing.
-- No model-name hardcoding (no BioMistral special-case).
+- Includes isolated prompt fallbacks specifically for Lingshu_7B to prevent "Choice-Position Bias" 
+  in long-context scenarios (using Recency Effect).
 """
 
 import os
@@ -301,6 +302,29 @@ def generate_final_answer(client, question: str, context: str, q_type: str, mode
             "Final Answer: "
         )
 
+    # =========================================================================
+    # [Lingshu 专属补丁]: 仅针对 Lingshu 生效，绝对隔离，不影响其他大模型。
+    # 利用在测试沙盒中胜出的“近因效应 + 极简指令”，防止其在长文本下丧失答题能力。
+    # =========================================================================
+    _IS_LINGSHU = "lingshu" in target_model.lower()
+    if _IS_LINGSHU:
+        if q_type_u == "MC":
+            system_prompt = "You are an expert medical exam taker. Output EXACTLY ONE uppercase letter (A, B, C, D, or E). Do not output anything else."
+            user_content = (
+                f"Read this context carefully:\n{context}\n\n"
+                f"Now answer this question:\n{question}\n\n"
+                "Output ONLY the uppercase letter (A, B, C, D, or E) of the correct option."
+            )
+            target_max_tokens = 20
+        elif q_type_u == "TF":
+            system_prompt = "You are an expert medical exam taker. Output EXACTLY Yes or No. Do not output anything else."
+            user_content = (
+                f"Read this context carefully:\n{context}\n\n"
+                f"Now evaluate this statement:\n{question}\n\n"
+                "Output ONLY Yes or No."
+            )
+            target_max_tokens = 20
+
     def _call(max_tokens: int):
         return _chat_with_retry(
             client=client,
@@ -320,6 +344,12 @@ def generate_final_answer(client, question: str, context: str, q_type: str, mode
         # ---- TF ----
         if q_type_u == "TF":
             parsed = _extract_yesno_answer(raw_output)
+            # Lingshu 专用兜底提取
+            if not parsed and _IS_LINGSHU:
+                match = re.search(r'(?i)\b(yes|no)\b', raw_output)
+                if match:
+                    parsed = match.group(1).capitalize()
+
             if parsed:
                 return parsed
 
@@ -333,14 +363,19 @@ def generate_final_answer(client, question: str, context: str, q_type: str, mode
             if parsed3:
                 return parsed3
 
-            # logging.warning(f"[TF_PARSE_FAIL] raw='{raw_output}' raw2='{raw2}' raw3='{raw3}'")
-            # return "No"  # 降级返回 No
             logging.warning(f"[TF_PARSE_FAIL] raw='{raw_output}' raw2='{raw2}' raw3='{raw3}'")
             return ""
 
         # ---- MC ----
         if q_type_u == "MC":
             parsed = _extract_mc_answer(raw_output, question=question)
+            
+            # Lingshu 专用物理防线：如果它输出了 "C. To help minimize..." 这种啰嗦结构，强行抓取首字母
+            if not parsed and _IS_LINGSHU:
+                match = re.search(r'\b([A-E])\b', raw_output.upper())
+                if match:
+                    parsed = match.group(1)
+                    
             if parsed:
                 return parsed
 
@@ -355,7 +390,6 @@ def generate_final_answer(client, question: str, context: str, q_type: str, mode
                 return parsed3
 
             logging.warning(f"[MC_PARSE_FAIL] raw='{raw_output}' raw2='{raw2}' raw3='{raw3}'")
-            # 【修复点】：不要盲目返回 A，改为返回空或者 C（或者交由模型自由输出，这里返回 "" 让评测判错，而不是制造伪造的 A）
             return ""
 
         # ---- QA ----
