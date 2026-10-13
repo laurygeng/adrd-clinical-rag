@@ -3,7 +3,7 @@
 Search Agent (Free & Medical-Focused: EuropePMC + DuckDuckGo)
 Features: Parallel Hybrid Retrieval, Multi-Gap Support, Concurrent LLM Refinement, and Pure Markdown Tracing.
 """
-
+import json
 import os
 import re
 import logging
@@ -108,22 +108,74 @@ def _generate_query(client: LocalLLMClient, target_info: str, question: str = ""
     except Exception:
         return fallback_query
 
-def _refine_evidence_text(client: LocalLLMClient, query: str, raw_text: str, model: str = "gpt-4o") -> str:
-    if not raw_text or len(raw_text) < 20: return ""
-    prompt = (
-        f"Extract the specific paragraphs and clinical facts from the text below that directly answer or verify: '{query}'. "
-        "Discard unrelated chit-chat or website navigation, but KEEP the full context of the relevant medical facts. Do NOT over-compress.\n\n"
-        f"Text:\n{raw_text[:1200]}\n\nExtracted Facts:"
-    )
-    try:
-        r = client.chat.completions.create(
-            model=model, temperature=0.0, max_tokens=250, messages=[{"role": "user", "content": prompt}]
-        )
-        txt = (r.choices[0].message.content or "").strip()
-        if not txt or _looks_unknown(txt): return raw_text[:400]
-        return txt
-    except Exception:
-        return raw_text[:400]
+# def _refine_evidence_text(client: LocalLLMClient, query: str, raw_text: str, model: str = "gpt-4o", q_type: str = "MC") -> str:
+#     if not raw_text or len(raw_text) < 20: return ""
+    
+#     q_type_u = str(q_type).strip().upper()
+
+#     if q_type_u == "MC":
+#         # ---------------------------------------------------------
+#         # MC 专属：严格的 JSON CoT 提纯防幻觉逻辑
+#         # ---------------------------------------------------------
+#         base_json_instruction = (
+#             "Task: Output valid JSON ONLY with two exact keys:\n"
+#             "- \"reasoning\": 1 short sentence evaluating if the text contains the SPECIFIC answer/facts to the query, or if it lacks them / is just generic background advice.\n"
+#             "- \"extracted\": The specific clinical facts, or \"NONE\" if the text lacks the specific answer."
+#         )
+#         prompt = (
+#             f"{base_json_instruction}\n"
+#             "CRITICAL FOR MULTIPLE CHOICE: Do NOT extract broad generic advice (like 'labels', 'color-coding', 'routines'). If the text only has generic advice but no specific answer, 'extracted' MUST be 'NONE'.\n\n"
+#             f"Query: '{query}'\nText:\n{raw_text[:1200]}\n\nJSON:"
+#         )
+#         try:
+#             r = client.chat.completions.create(
+#                 model=model, temperature=0.0, max_tokens=250, messages=[{"role": "user", "content": prompt}]
+#             )
+#             raw_output = (r.choices[0].message.content or "").strip()
+#             raw_output = re.split(r"(?i)### response", raw_output)[0].strip()
+#             match = re.search(r"\{.*?\}", raw_output, re.DOTALL)
+#             if match:
+#                 data = json.loads(match.group(0))
+#                 extracted_val = str(data.get("extracted", "NONE")).strip()
+#                 if extracted_val.upper() == "NONE": return ""
+#                 if "does not provide" in extracted_val.lower() or "not mention" in extracted_val.lower(): return ""
+#                 return extracted_val
+#             return ""
+#         except Exception as e:
+#             logger.error(f"Evidence refinement JSON parsing failed: {e}")
+#             return ""
+#     else:
+#         # ---------------------------------------------------------
+#         # TF 和 QA 专属：完全恢复到之前的旧版逻辑，保留充足上下文
+#         # ---------------------------------------------------------
+#         prompt = (
+#             f"Extract the specific paragraphs and clinical facts from the text below that directly answer or verify: '{query}'. "
+#             "Discard unrelated chit-chat or website navigation, but KEEP the full context of the relevant medical facts. Do NOT over-compress.\n\n"
+#             f"Text:\n{raw_text[:1200]}\n\nExtracted Facts:"
+#         )
+#         try:
+#             r = client.chat.completions.create(
+#                 model=model, temperature=0.0, max_tokens=250, messages=[{"role": "user", "content": prompt}]
+#             )
+#             txt = (r.choices[0].message.content or "").strip()
+#             # 恢复旧版的截断兜底逻辑
+#             if not txt or _looks_unknown(txt): return raw_text[:400]
+#             return txt
+#         except Exception:
+#             return raw_text[:400]
+
+def _refine_evidence_text(client: LocalLLMClient, query: str, raw_text: str, model: str = "gpt-4o", q_type: str = "MC") -> str:
+    """
+    Cross-model ablation experiments proved that intermediate LLM refinement (including JSON CoT)
+    causes irreversible information loss and entropy reduction for 7B-8B models, leading to performance drops.
+    Optimal strategy: Zero-Refinement (Raw Context Bypass), maximizing information retention for the final generator.
+    """
+    if not raw_text or len(raw_text) < 20: 
+        return ""
+    
+    # Bypass all intermediate LLM compression for ALL task types (MC, TF, QA)
+    # Return the raw evidence directly, letting the downstream Answer Agent handle the full context.
+    return str(raw_text)[:1200]
 
 def _europepmc(query: str, n: int = 2) -> List[Dict[str, str]]:
     med_query = query if "dementia" in query.lower() or "alzheimer" in query.lower() else f"{query} dementia"
@@ -170,11 +222,9 @@ def _local_fallback(query: str, retriever) -> List[Dict[str, str]]:
         return []
 
 def research(client: LocalLLMClient, target_info: str, question: str = "", retriever=None, q_type: str = "MC", model_name: str = "gpt-4o") -> Tuple[List[Dict[str, str]], str, str]:
-    # Start capturing steps for the MD file
     log_lines = ["\n## Completion Retrieval (Web Search) Log\n"]
     logger.info("Search Agent started: Suppressing console debugs, routing details to MD trace.")
     
-    # 1. Split Multiple Gaps and Generate Queries Concurrently
     raw_gaps = [g.strip() for g in target_info.split("|") if g.strip()]
     if not raw_gaps: raw_gaps = [target_info]
     
@@ -194,41 +244,20 @@ def research(client: LocalLLMClient, target_info: str, question: str = "", retri
         queries = [_rule_fallback_query(target_info, question)]
         log_lines.append(f"- **Fallback Triggered**: `{queries[0]}`")
 
-    # 2. Parallel Hybrid Search
-    # log_lines.append("\n### Search Execution")
-    # raw_evidence = []
-    # with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
-    #     search_futures = []
-    #     for q in queries:
-    #         search_futures.append(executor.submit(_europepmc, q, 2))
-    #         if HAS_DDGS: search_futures.append(executor.submit(_duckduckgo, q, 2))
-            
-    #     for future in concurrent.futures.as_completed(search_futures):
-    #         res = future.result()
-    #         if res: raw_evidence.extend(res)
-    
-    # 2. Parallel Hybrid Search
     log_lines.append("\n### Search Execution")
     raw_evidence = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
         search_futures = []
-        
-        # 照护类/生活类词汇库
         care_keywords = ["care", "home", "clothing", "behavior", "agitation", "sleep", "dressing", "eat", "daily", "supervision", "diet", "driving", "financial"]
-        
         for q in queries:
             q_lower = q.lower()
             is_care_query = any(k in q_lower for k in care_keywords)
-            
-            # 核心策略：如果是照护细节题，压制 EuropePMC(学术文献降为1)，增加 DuckDuckGo(通俗网页升为3)
             epmc_limit = 1 if is_care_query else 2
             ddg_limit = 3 if is_care_query else 2
-            
             search_futures.append(executor.submit(_europepmc, q, epmc_limit))
             if HAS_DDGS: 
                 search_futures.append(executor.submit(_duckduckgo, q, ddg_limit))
 
-    # Deduplicate
     unique_evidence = []
     seen_urls, seen_texts = set(), set()
     for item in raw_evidence:
@@ -248,7 +277,6 @@ def research(client: LocalLLMClient, target_info: str, question: str = "", retri
     else:
         log_lines.append(f"- Retrieved {len(unique_evidence)} unique items from external sources.")
 
-    # 3. Parallel LLM Evidence Refinement
     log_lines.append("\n### LLM Evidence Refinement (Noise Filtering)")
     refined_evidence = []
     
@@ -258,27 +286,44 @@ def research(client: LocalLLMClient, target_info: str, question: str = "", retri
         source = item.get("source", "unknown")
         title = item.get("title", "No Title")
         url = item.get("url", "No URL")
-        refined_txt = _refine_evidence_text(client, combined_q, raw_txt, model=model_name)
+        refined_txt = _refine_evidence_text(client, combined_q, raw_txt, model=model_name, q_type=q_type)
         return idx, source, title, url, raw_txt, refined_txt
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
         refine_futures = [executor.submit(_refine_task, i, item, queries) for i, item in enumerate(unique_evidence)]
         for future in concurrent.futures.as_completed(refine_futures):
             idx, source, title, url, raw_txt, refined_txt = future.result()
-            if refined_txt and not _looks_unknown(refined_txt):
-                refined_evidence.append({"source": source, "title": title, "url": url, "text": refined_txt, "idx": idx})
-                log_lines.append(f"- ✅ **[KEPT]** Source: `{source}` | URL: {url}")
-            elif raw_txt:
-                refined_evidence.append({"source": source, "title": title, "url": url, "text": raw_txt[:400], "idx": idx})
-                log_lines.append(f"- ⚠️ **[KEPT_RAW]** Source: `{source}` | Reason: LLM refinement failed or bypassed.")
+            
+            # --- 题型隔离的外部兜底逻辑 ---
+            if str(q_type).strip().upper() == "MC":
+                # MC：严苛过滤，不允许 raw_text 兜底
+                if refined_txt and not _looks_unknown(refined_txt):
+                    refined_evidence.append({"source": source, "title": title, "url": url, "text": refined_txt, "idx": idx})
+                    log_lines.append(f"- ✅ **[KEPT]** Source: `{source}` | URL: {url}")
+                else:
+                    log_lines.append(f"- ❌ **[DROPPED]** Source: `{source}` | Reason: Filtered out by JSON CoT.")
             else:
-                log_lines.append(f"- ❌ **[DROPPED]** Source: `{source}` | Reason: Empty or invalid text.")
+                # TF 和 QA：恢复老版本兜底逻辑
+                if refined_txt and not _looks_unknown(refined_txt):
+                    refined_evidence.append({"source": source, "title": title, "url": url, "text": refined_txt, "idx": idx})
+                    log_lines.append(f"- ✅ **[KEPT]** Source: `{source}` | URL: {url}")
+                elif raw_txt:
+                    refined_evidence.append({"source": source, "title": title, "url": url, "text": raw_txt[:400], "idx": idx})
+                    log_lines.append(f"- ⚠️ **[KEPT_RAW]** Source: `{source}` | Reason: LLM refinement failed or bypassed (Old Logic).")
+                else:
+                    log_lines.append(f"- ❌ **[DROPPED]** Source: `{source}` | Reason: Empty or invalid text.")
 
-    # Restore order
     refined_evidence.sort(key=lambda x: x.get("idx", 0))
     for item in refined_evidence: item.pop("idx", None)
 
-    final_ev = refined_evidence if refined_evidence else unique_evidence
+    # --- 题型隔离的最终集合返回 ---
+    if str(q_type).strip().upper() == "MC":
+        # MC 宁缺毋滥，如果全军覆没返回空数组
+        final_ev = refined_evidence
+    else:
+        # TF 和 QA 如果全部被过滤，依然按照老版本强制用未过滤的 unique_evidence 兜底
+        final_ev = refined_evidence if refined_evidence else unique_evidence
+        
     returned_queries = " | ".join(queries)
     log_lines.append(f"\n- **Final Verification**: {len(final_ev)} evidence items sent to Integration Agent.\n")
     

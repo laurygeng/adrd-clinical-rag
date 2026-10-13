@@ -24,7 +24,7 @@ from core.trace_logger import write_jsonl, make_item_id, get_run_dir
 # 导入自动归档脚本
 try:
     from core.archive_web_context_to_kb import archive_evidence_records
-    ARCHIVE_AVAILABLE = True
+    ARCHIVE_AVAILABLE = False # 测试版本
 except ImportError:
     ARCHIVE_AVAILABLE = False
     logging.warning("⚠️ archive_web_context_to_kb module not found. Web archiving disabled.")
